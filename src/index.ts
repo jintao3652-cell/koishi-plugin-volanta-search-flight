@@ -19,24 +19,149 @@ const OutputFormat = {
 
 type OutputFormat = typeof OutputFormat[keyof typeof OutputFormat]
 
-async function sendFlightForward(session: Session, routeMessage: string, mainMessage: any[]) {
-  const nodes = [
-    { type: 'node', data: { user_id: session.userId || '0', nickname: 'Volanta', content: routeMessage } },
-    { type: 'node', data: { user_id: session.userId || '0', nickname: 'Volanta', content: mainMessage } }
-  ]
-  const bot = session.bot as any
-  const action = session.isDirect ? 'send_private_forward_msg' : 'send_group_forward_msg'
-  const params: any = session.isDirect
-    ? { user_id: session.userId, messages: nodes }
-    : { group_id: session.guildId || session.channelId, messages: nodes }
-  const api = bot?.internal?.[action] || bot?.[action]
-  if (typeof api === 'function' && params.user_id || typeof api === 'function' && params.group_id) {
+/**
+ * 统一调用 OneBot 接口。
+ * adapter-onebot 的 internal 暴露了通用入口 `_get(action, params)`，可以直接调用协议端
+ * 实现的任意接口（包含 NapCat 的扩展接口），因此 NapCat 与 LLOneBot 共用同一套
+ * OneBot 11 / Go-CQHTTP 的 action 名与参数，不需要再按协议端区分。
+ * 仅在通用入口不可用时，才退回方法名探测。
+ */
+async function oneBotCall(bot: any, action: string, params: Record<string, any>) {
+  const internal: any = bot?.internal
+  if (typeof internal?._get === 'function') return await internal._get(action, params)
+  if (typeof internal?._request === 'function') {
+    const response = await internal._request(action, params)
+    if (response && typeof response === 'object' && 'retcode' in response) {
+      if (response.retcode === 0) return response.data
+      throw new Error(`OneBot ${action} failed: retcode=${response.retcode} ${response.message || response.wording || ''}`.trim())
+    }
+    return response
+  }
+  const method = action.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase())
+  const candidates: Array<{ target: any, fn: Function }> = []
+  for (const [target, key] of [[bot, `$${action}`], [bot, action], [bot, method], [internal, `$${action}`], [internal, action], [internal, method]] as const) {
+    const fn = (target as any)?.[key]
+    if (typeof fn === 'function') candidates.push({ target, fn })
+  }
+  let lastError: any
+  for (const { target, fn } of candidates) {
+    try { return await fn.call(target, params) } catch (error) { lastError = error }
+  }
+  if (lastError) throw lastError
+  throw new Error(`OneBot action not available: ${action}`)
+}
+
+/** 给 Promise 加超时，避免协议端对未知 action 不返回响应时一直等到适配器的 responseTimeout（默认 1 分钟）。 */
+function oneBotWithTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} 调用超时（${ms}ms）`)), ms)
+    promise.then(
+      value => { clearTimeout(timer); resolve(value) },
+      error => { clearTimeout(timer); reject(error) },
+    )
+  })
+}
+
+const FORWARD_ATTEMPT_TIMEOUT = 10000
+
+/**
+ * 发送合并转发消息。
+ * 尝试顺序：
+ * 1. Go-CQHTTP 兼容的 `send_group_forward_msg` / `send_private_forward_msg`（NapCat 与 LLOneBot 都支持）；
+ * 2. NapCat 统一的 `send_forward_msg`（参数 `message`）；
+ * 3. NapCat 统一的 `send_forward_msg`（参数 `messages`）。
+ * 每次尝试都带超时，失败后立即尝试下一个。
+ */
+async function oneBotSendForward(bot: any, groupId: string | null, userId: string | null, nodes: any[]) {
+  const attempts: Array<[string, Record<string, any>]> = groupId
+    ? [
+      ['send_group_forward_msg', { group_id: groupId, messages: nodes }],
+      ['send_forward_msg', { message_type: 'group', group_id: groupId, message: nodes }],
+      ['send_forward_msg', { message_type: 'group', group_id: groupId, messages: nodes }],
+    ]
+    : userId
+      ? [
+        ['send_private_forward_msg', { user_id: userId, messages: nodes }],
+        ['send_forward_msg', { message_type: 'private', user_id: userId, message: nodes }],
+        ['send_forward_msg', { message_type: 'private', user_id: userId, messages: nodes }],
+      ]
+      : []
+  let lastError: any
+  for (const [action, params] of attempts) {
     try {
-      await api.call(bot.internal?.[action] === api ? bot.internal : bot, params)
+      return await oneBotWithTimeout(oneBotCall(bot, action, params), FORWARD_ATTEMPT_TIMEOUT, action)
+    } catch (error) {
+      lastError = error
+    }
+  }
+  if (lastError) throw lastError
+  throw new Error('OneBot forward action not available')
+}
+
+/**
+ * 把 Koishi 的消息元素 / 字符串转换成 OneBot 消息段。
+ * OneBot 合并转发节点的 `content` 必须是消息段数组（`{ type, data }`）；
+ * 直接塞 Koishi 元素（如 `h.image(buf)`）客户端会显示「该消息类型暂不支持查看」。
+ */
+function toForwardContent(items: any[]): any[] {
+  const segments: any[] = []
+  for (const item of items) {
+    if (typeof item === 'string') {
+      if (item) segments.push({ type: 'text', data: { text: item } })
+      continue
+    }
+    if (!item || typeof item !== 'object') continue
+    const type = String(item.type || '')
+    if (type === 'text') {
+      const text = String(item.attrs?.content ?? '')
+      if (text) segments.push({ type: 'text', data: { text } })
+      continue
+    }
+    if (type === 'img' || type === 'image') {
+      const src = String(item.attrs?.src ?? item.attrs?.url ?? '')
+      if (!src) continue
+      // h.image(buffer) 生成的是 data URL，需要转成 OneBot 的 base64:// 协议
+      const base64Token = ';base64,'
+      const index = src.indexOf(base64Token)
+      const file = index > -1 ? `base64://${src.slice(index + base64Token.length)}` : src
+      segments.push({ type: 'image', data: { file } })
+      continue
+    }
+    if (type === 'br') {
+      segments.push({ type: 'text', data: { text: '\n' } })
+      continue
+    }
+    if (type === 'at') {
+      const id = item.attrs?.id ?? item.attrs?.type ?? 'all'
+      segments.push({ type: 'at', data: { qq: String(id) } })
+      continue
+    }
+  }
+  if (!segments.length) segments.push({ type: 'text', data: { text: ' ' } })
+  return segments
+}
+
+async function sendFlightForward(session: Session, routeMessage: string, mainMessage: any[]) {
+  const bot = session.bot as any
+  const groupId = session.isDirect ? null : String(session.guildId || session.channelId || '')
+  const userId = session.isDirect ? String(session.userId || session.channelId || '') : null
+  // 合并转发节点用机器人自己的账号展示（用他人 QQ 号会被协议端拒绝）
+  const selfId = String(bot?.selfId ?? session.userId ?? '10000').match(/\d+/g)?.pop() || '10000'
+  const nodes = [
+    { type: 'node', data: { user_id: selfId, nickname: 'Volanta', content: toForwardContent([routeMessage]) } },
+    { type: 'node', data: { user_id: selfId, nickname: 'Volanta', content: toForwardContent(mainMessage) } },
+  ]
+  if ((session.platform === 'onebot' || bot?.platform === 'onebot') && (groupId || userId)) {
+    try {
+      await oneBotSendForward(bot, groupId, userId, nodes)
       return
     } catch {}
   }
-  const forward = segment('message', { forward: true }, nodes.map(node => segment('message', {}, node.data.content)))
+  // 非 OneBot 平台，或 OneBot 合并转发失败：回退为 Koishi 原生合并转发
+  const forward = segment('message', { forward: true }, [
+    segment('message', {}, routeMessage),
+    segment('message', {}, ...mainMessage),
+  ])
   await session.send(forward)
 }
 
@@ -613,10 +738,6 @@ export function apply(ctx: Context, config: Config) {
     return matches[matches.length - 1]
   }
 
-  function toCamelCase(value: string): string {
-    return value.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase())
-  }
-
   function toOneBotImageFile(src: string): string {
     // Some upstream records contain a Markdown link instead of a raw image URL.
     // OneBot accepts the URL itself in `file`, not `[URL](URL)`.
@@ -676,34 +797,6 @@ export function apply(ctx: Context, config: Config) {
     }))
   }
 
-  async function callOneBotApi(bot: any, action: string, params: Record<string, any>) {
-    const method = toCamelCase(action)
-    const candidates: Array<{ target: any, fn: Function }> = []
-    const pushCandidate = (target: any, key: string) => {
-      const fn = target?.[key]
-      if (typeof fn === 'function') candidates.push({ target, fn })
-    }
-
-    pushCandidate(bot, `$${action}`)
-    pushCandidate(bot, action)
-    pushCandidate(bot, method)
-    pushCandidate(bot?.internal, `$${action}`)
-    pushCandidate(bot?.internal, action)
-    pushCandidate(bot?.internal, method)
-
-    let lastError: any
-    for (const fn of candidates) {
-      try {
-        return await fn.fn.call(fn.target, params)
-      } catch (error) {
-        lastError = error
-      }
-    }
-
-    if (lastError) throw lastError
-    throw new Error(`OneBot action not available: ${action}`)
-  }
-
   async function sendMergedForwardNodes(session: Session, nodes: ForwardNode[]): Promise<boolean> {
     if (!session || nodes.length === 0) return false
 
@@ -711,26 +804,13 @@ export function apply(ctx: Context, config: Config) {
     if ((session.platform === 'onebot' || bot?.platform === 'onebot') && bot) {
       try {
         const messages = toOneBotForwardNodes(session, nodes)
-        if (session.isDirect) {
-          const userId = extractOneBotTargetId(session.userId || session.channelId)
-          if (userId) {
-            if (typeof bot.internal?.sendPrivateForwardMsg === 'function') {
-              await bot.internal.sendPrivateForwardMsg(userId, messages)
-            } else {
-              await callOneBotApi(bot, 'send_private_forward_msg', { user_id: userId, messages })
-            }
-            return true
-          }
-        } else {
-          const groupId = extractOneBotTargetId(session.guildId || session.channelId)
-          if (groupId) {
-            if (typeof bot.internal?.sendGroupForwardMsg === 'function') {
-              await bot.internal.sendGroupForwardMsg(groupId, messages)
-            } else {
-              await callOneBotApi(bot, 'send_group_forward_msg', { group_id: groupId, messages })
-            }
-            return true
-          }
+        const groupId = session.isDirect ? null : extractOneBotTargetId(session.guildId || session.channelId)
+        const userId = session.isDirect ? extractOneBotTargetId(session.userId || session.channelId) : null
+        if (groupId || userId) {
+          // NapCat 使用统一的 send_forward_msg，LLOneBot 使用 send_group/private_forward_msg，
+          // oneBotSendForward 会依次尝试，两者都可用。
+          await oneBotSendForward(bot, groupId, userId, messages)
+          return true
         }
       } catch (error: any) {
         log('warn', 'OneBot合并转发失败，回退普通发送', {
@@ -1072,7 +1152,7 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  // “volanta查询 <关键词>”可直接使用呼号、Volanta 用户名或航班号。
+  // "volanta查询 <关键词>"可直接使用呼号、Volanta 用户名或航班号。
   // 精确匹配优先，避免用户名包含关系抢走同名的呼号/航班号查询；仍保留
   // 原本的用户名包含匹配，以兼容旧用法。
   async function fetchFlightByQuery(query: string, forceRefresh: boolean = false): Promise<VolantaFlight | null> {
@@ -1148,7 +1228,7 @@ export function apply(ctx: Context, config: Config) {
   }
 
   // 截图函数
-  async function captureFlightScreenshot(flight: VolantaFlight): Promise<Buffer | null> {
+  async function captureFlightScreenshot(flight: VolantaFlight, attempt: number = 1): Promise<Buffer | null> {
     if (isBlockedAircraftRegistration(flight.aircraftRegistration)) {
       log('info', '注册号匹配图片拦截规则，已跳过 Volanta 截图', {
         flightId: flight.id,
@@ -1169,7 +1249,18 @@ export function apply(ctx: Context, config: Config) {
 
     log('debug', 'Puppeteer服务可用，开始创建页面')
     const page = await ctx.puppeteer.page()
-    
+
+    // 跟踪加载失败的资源，便于诊断白屏原因
+    const failedRequests: string[] = []
+    ;(page as any).on?.('requestfailed', (request: any) => {
+      if (failedRequests.length < 20) {
+        failedRequests.push(`${request.failure()?.errorText || 'failed'} ${String(request.url()).slice(0, 120)}`)
+      }
+    })
+
+    const maxAttempts = Math.max(1, (config.retryCount || 0) + 1)
+    let blankDetected = false
+
     try {
       log('debug', '设置页面视窗', { 
         width: config.viewportWidth, 
@@ -1277,6 +1368,13 @@ export function apply(ctx: Context, config: Config) {
       await page.evaluate(() => window.dispatchEvent(new Event('resize')))
       await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
       
+      // 渲染健康检查：页面 JS 加载失败时 React 无法渲染，整页截图会接近纯白
+      const renderState = await page.evaluate(() => ({
+        textLength: (document.body?.innerText || '').trim().length,
+        images: document.images.length,
+        imagesLoaded: Array.from(document.images).filter(img => img.naturalWidth > 0).length,
+      }))
+
       log('debug', '开始截图')
       const screenshotStartTime = Date.now()
       const screenshot = await page.screenshot({ 
@@ -1284,12 +1382,24 @@ export function apply(ctx: Context, config: Config) {
         fullPage: true
       }) as Buffer
       const screenshotDuration = Date.now() - screenshotStartTime
-      
-      log('info', '截图完成', { 
-        duration: screenshotDuration,
-        size: screenshot.length 
-      })
-      return screenshot
+
+      // 空白检测：页面完全未渲染时整页 PNG 体积极小（正常渲染远大于该阈值）
+      if (screenshot.length < 20000 && renderState.textLength < 50) {
+        blankDetected = true
+        log('warn', '截图疑似空白页面（页面未完成渲染）', {
+          size: screenshot.length,
+          renderState,
+          failedRequests,
+          attempt,
+          maxAttempts,
+        })
+      } else {
+        log('info', '截图完成', { 
+          duration: screenshotDuration,
+          size: screenshot.length 
+        })
+        return screenshot
+      }
       
     } catch (error: any) {
       log('error', '截图过程中发生错误', { 
@@ -1301,6 +1411,13 @@ export function apply(ctx: Context, config: Config) {
       log('debug', '关闭页面')
       await page.close()
     }
+
+    // 空白重试：网络抖动导致页面 JS 未加载时通常重试即可恢复
+    if (blankDetected && attempt < maxAttempts) {
+      log('info', '空白截图，正在重试', { nextAttempt: attempt + 1, maxAttempts })
+      return captureFlightScreenshot(flight, attempt + 1)
+    }
+    return null
   }
 
   // 构建航班信息文本（增强版，包含机场中文名称）
@@ -1515,7 +1632,7 @@ export function apply(ctx: Context, config: Config) {
           const selectionLines = [
             `找到 ${summaries.length} 条 ${searchFlightNumber} 的匹配记录：`,
             ...summaries.map(item => item.summary),
-            '请回复序号选择航班，或发送“取消”退出。'
+            '请回复序号选择航班，或发送"取消"退出。'
           ]
           await session.send(selectionLines.join('\n'))
 
