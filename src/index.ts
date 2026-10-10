@@ -1,7 +1,30 @@
 import { Context, Schema, h, segment, Session, Fragment } from 'koishi'
 import { } from 'koishi-plugin-puppeteer'
-import { existsSync, readFileSync, writeFileSync } from 'fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
+import { createRequire } from 'node:module'
 import { resolve } from 'path'
+
+/**
+ * 加载可选依赖（如 sharp），失败返回 null 而不抛出。
+ * 注意：不要只写 `(0, eval)('require')` —— 间接 eval 在**全局作用域**求值，
+ * 而 Node 的 require 是每个模块包装函数的**局部参数**，在以 require() 方式加载的
+ * 模块（Koishi 正是这样加载插件的）里会报 require is not defined，导致逻辑静默失效。
+ * 因此依次尝试：模块局部 require → 间接 eval → 基于 cwd 的 createRequire。
+ */
+function requireOptional(id: string): any {
+  const candidates: (() => any)[] = [
+    () => (typeof require === 'function' ? require : null),
+    () => (0, eval)('require'),
+    () => createRequire(process.cwd() + '/index.js'),
+  ]
+  for (const get of candidates) {
+    try {
+      const req = get() as NodeRequire | null
+      if (req) return req(id)
+    } catch { /* 换下一种 */ }
+  }
+  return null
+}
 
 export const name = 'volanta-search'
 
@@ -18,6 +41,18 @@ const OutputFormat = {
 } as const
 
 type OutputFormat = typeof OutputFormat[keyof typeof OutputFormat]
+
+// AI 图片合规识别：默认提示词（模型只需回复 BLOCK 或 PASS）
+const DEFAULT_AI_PROMPT = [
+  '你是一个图片内容合规审核引擎。请判断这张图片是否包含违反一个中国原则的内容，',
+  '包括但不限于：台湾当局使用的旗帜（青天白日满地红旗）、所谓“台湾国旗”图案、',
+  '“台独”标语或标志、以及任何把台湾表现为独立国家的旗帜、徽标或宣传文字。',
+  '注意：地图底图上常规的地名标注（如 Taiwan、Taipei、Taiwan Strait 等英文地名）、',
+  '地理轮廓、航班图标都不算违规内容；航空公司涂装标志不算旗帜。',
+  '若存在上述违规内容，只回复 BLOCK；否则只回复 PASS。不要输出任何其他内容。',
+].join('')
+
+const AI_BLOCK_NOTICE = '🚫 图片包含违反一个中国原则的内容，已被拦截。'
 
 /**
  * 统一调用 OneBot 接口。
@@ -141,34 +176,53 @@ function toForwardContent(items: any[]): any[] {
   return segments
 }
 
+// 模块级兜底日志：sendFlightForward 位于 apply 之外，拿不到插件 logger，
+// 之前的 log() 引用会直接导致 tsc 编译失败，这里改为 console 兜底输出。
+function moduleLog(level: 'info' | 'warn' | 'error', message: string, data?: any) {
+  try {
+    console[level](`[volanta-search] ${message}`, data ?? '')
+  } catch { }
+}
+
 async function sendFlightForward(session: Session, routeMessage: string, mainMessage: any[]) {
   const bot = session.bot as any
-  const groupId = session.isDirect ? null : String(session.guildId || session.channelId || '')
-  const userId = session.isDirect ? String(session.userId || session.channelId || '') : null
-  // 合并转发节点用机器人自己的账号展示（用他人 QQ 号会被协议端拒绝）
-  const selfId = String(bot?.selfId ?? session.userId ?? '10000').match(/\d+/g)?.pop() || '10000'
-  const nodes = [
-    { type: 'node', data: { user_id: selfId, nickname: 'Volanta', content: toForwardContent([routeMessage]) } },
-    { type: 'node', data: { user_id: selfId, nickname: 'Volanta', content: toForwardContent(mainMessage) } },
-  ]
-  if ((session.platform === 'onebot' || bot?.platform === 'onebot') && (groupId || userId)) {
-    try {
-      await oneBotSendForward(bot, groupId, userId, nodes)
-      return
-    } catch {}
+  const isOneBot = session.platform === 'onebot' || bot?.platform === 'onebot'
+
+  if (isOneBot) {
+    const groupId = session.isDirect ? null : String(session.guildId || session.channelId || '')
+    const userId = session.isDirect ? String(session.userId || session.channelId || '') : null
+    // 合并转发节点用机器人自己的账号展示（用他人 QQ 号会被协议端拒绝）
+    const selfId = String(bot?.selfId ?? session.userId ?? '10000').match(/\d+/g)?.pop() || '10000'
+    const nodes = [
+      { type: 'node', data: { user_id: selfId, nickname: 'Volanta', content: toForwardContent([routeMessage]) } },
+      { type: 'node', data: { user_id: selfId, nickname: 'Volanta', content: toForwardContent(mainMessage) } },
+    ]
+    if (groupId || userId) {
+      try {
+        await oneBotSendForward(bot, groupId, userId, nodes)
+        return
+      } catch (error: any) {
+        moduleLog('warn', 'OneBot 合并转发失败，回退普通发送', { error: error?.message || String(error) })
+      }
+    }
+    // OneBot 转发不可用：逐条普通发送（图片可正常附带）
+    await session.send(routeMessage)
+    await session.send(mainMessage)
+    return
   }
-  // 非 OneBot 平台，或 OneBot 合并转发失败：回退为 Koishi 原生合并转发
-  const forward = segment('message', { forward: true }, [
-    segment('message', {}, routeMessage),
-    segment('message', {}, ...mainMessage),
-  ])
-  await session.send(forward)
+
+  // 非 OneBot 平台（Discord 等）：合并转发段在部分适配器下无法附带 base64 截图，
+  // 直接按节点逐条以普通消息发送，确保截图图片能正常附带。
+  await session.send(routeMessage)
+  await session.send(mainMessage)
 }
 
 export interface Config {
   timeout: number
+  dataTimeout: number
   selectionTimeout: number
   screenshotDelay: number
+  zoomLevel: number
   outputFormat: OutputFormat
   enableLogging: boolean
   retryCount: number
@@ -180,8 +234,17 @@ export interface Config {
   enableImageOptimization: boolean
   imageQuality: number
   enableAirportChineseName: boolean
+  // 机场中文名接口超时
+  airportApiTimeout: number
   // 强制刷新配置
   forceRefresh: boolean
+  // AI 图片合规识别
+  aiEnabled: boolean
+  aiApiUrl: string
+  aiApiKey: string
+  aiModel: string
+  aiTimeout: number
+  aiPrompt: string
 }
 
 export const Config = Schema.object({
@@ -191,6 +254,13 @@ export const Config = Schema.object({
     .max(120000)
     .step(1000)
     .description('请求超时时间(毫秒)'),
+
+  dataTimeout: Schema.number()
+    .default(60000)
+    .min(10000)
+    .max(180000)
+    .step(5000)
+    .description('汇总航班数据(约3MB JSON)请求超时(毫秒)。上游 Cloudflare 不缓存该文件、每次都回源，网络差时单次下载可能超过 60 秒，建议不低于 60000'),
   
   selectionTimeout: Schema.number()
     .default(60000)
@@ -205,7 +275,14 @@ export const Config = Schema.object({
     .max(15000)
     .step(1000)
     .description('点击后等待截图时间(毫秒)'),
-  
+
+  zoomLevel: Schema.number()
+    .default(2)
+    .min(1)
+    .max(3)
+    .step(0.5)
+    .description('截图缩放倍数(deviceScaleFactor)：>1 时截图像素密度更高、细节更清晰，便于 AI 识别画面里的小图标与文字，群内显示也更清楚；倍数越大截图体积与耗时越大'),
+
   retryCount: Schema.number()
     .default(2)
     .min(0)
@@ -257,10 +334,47 @@ export const Config = Schema.object({
   enableAirportChineseName: Schema.boolean()
     .default(true)
     .description('启用机场中文名称查询'),
-  
+
+  airportApiTimeout: Schema.number()
+    .default(5000)
+    .min(1000)
+    .max(60000)
+    .step(500)
+    .description('机场中文名称接口超时时间(毫秒)；接口异常后 10 分钟内不再重试'),
+
   forceRefresh: Schema.boolean()
     .default(true)
     .description('每次查询都强制刷新航班数据'),
+
+  aiEnabled: Schema.boolean()
+    .role('switch')
+    .default(false)
+    .description('启用 AI 图片合规识别：对 Volanta 截图、头像与飞机配图进行识别，拦截违反一个中国原则的图片（如台湾旗帜）'),
+
+  aiApiUrl: Schema.string()
+    .default('https://api.openai.com/v1/chat/completions')
+    .description('OpenAI 标准格式的 chat/completions 接口完整地址（支持自定义网关）'),
+
+  aiApiKey: Schema.string()
+    .role('secret')
+    .default('')
+    .description('AI 接口密钥（Bearer Token，可留空）'),
+
+  aiModel: Schema.string()
+    .default('gpt-4o-mini')
+    .description('自定义模型名称（需支持图片输入）'),
+
+  aiTimeout: Schema.number()
+    .default(30000)
+    .min(5000)
+    .max(120000)
+    .step(1000)
+    .description('AI 识别请求超时时间(毫秒)'),
+
+  aiPrompt: Schema.string()
+    .role('textarea')
+    .default(DEFAULT_AI_PROMPT)
+    .description('审核提示词；模型只需回复 BLOCK（拦截）或 PASS（放行）'),
 })
 
 // 定义Volanta API返回的数据结构
@@ -392,10 +506,6 @@ interface VolantaRecentFlightItem {
   summarisedPositions?: unknown[]
 }
 
-function isBlockedAircraftRegistration(registration: unknown): boolean {
-  return /^B-\d{5}$/i.test(String(registration ?? '').trim())
-}
-
 type ForwardNode = {
   message: Fragment
 }
@@ -430,13 +540,31 @@ export function apply(ctx: Context, config: Config) {
   
   // 机场信息缓存
   const airportCache = new Map<string, AirportInfo>()
+
+  // 机场信息接口失败缓存：icao → 失败时间。接口异常后 10 分钟内跳过重试，
+  // 避免机场接口超时（如 xflysim 接口不可用）拖慢每一次航班查询。
+  const airportFailCache = new Map<string, number>()
+  const AIRPORT_FAIL_TTL = 10 * 60 * 1000
   
   // 航班数据缓存 - 添加强制刷新控制
   type FlightCache = {
     data: VolantaFlight[]
     timestamp: number
+    // 数据来自磁盘（上次成功抓取落盘），仅作为上游超时时的兜底
+    fromDisk?: boolean
   }
+
   let flightCache: FlightCache | null = null
+
+  // 汇总航班数据落盘路径：上游只剩内存缓存时，插件重载/koishi 重启后
+  // 首次查询一旦遇到上游超时就会直接失败，落盘可让这时候仍有数据可用。
+  const flightCacheFilePath = resolve(ctx.baseDir || process.cwd(), 'data', 'volanta-flight-cache.json')
+  // 落盘节流：避免 forceRefresh 场景下每 30 秒就写一次 3MB
+  const FLIGHT_CACHE_SAVE_INTERVAL = 5 * 60 * 1000
+  let lastFlightCacheSavedAt = 0
+  // 并发去重：多个查询同时触发时只发一次约 3MB 的上游请求
+  let flightFetchInFlight: Promise<VolantaFlight[]> | null = null
+
 
   // 详细日志记录函数
   const log = (level: 'info' | 'warn' | 'error' | 'debug', message: string, data?: any) => {
@@ -449,6 +577,205 @@ export function apply(ctx: Context, config: Config) {
         logger[level](formattedMessage)
       }
     }
+  }
+
+  // AI 图片合规识别结果缓存：key → 是否拦截
+  const imageComplianceCache = new Map<string, boolean>()
+
+  /**
+   * 调用 OpenAI 标准格式的 chat/completions 接口（自定义网关 + 自定义模型），
+   * 对单张图片做合规识别。返回 true=拦截 / false=放行 / null=识别不可用（放行）。
+   */
+  /** 安全序列化：JSON.stringify 失败或超长时截断，避免日志爆炸。 */
+  function stringifyForLog(value: unknown, maxLength = 2000): string {
+    try {
+      const text = JSON.stringify(value) ?? String(value)
+      return text.length > maxLength ? `${text.slice(0, maxLength)}…(共 ${text.length} 字符)` : text
+    } catch (error: any) {
+      return `<序列化失败: ${error?.message || String(error)}>`
+    }
+  }
+
+  // 送审 AI 的图片负载上限（base64 字符数）。超过时尝试压缩，避免网关拒收导致整次识别失败放行。
+  const AI_MAX_BASE64_LENGTH = 4_000_000
+
+  /**
+   * 截图过大时压缩后再送 AI（高 zoomLevel 下 fullPage 截图可能达到数 MB）。
+   * sharp 为可选增强依赖：不可用或压缩失败时原样返回，不影响主流程。
+   */
+  async function prepareImageForAi(buffer: Buffer): Promise<{ data: Buffer; mime: string }> {
+    if (buffer.length * 4 / 3 <= AI_MAX_BASE64_LENGTH) return { data: buffer, mime: 'image/png' }
+    // 可选增强依赖，不可用时按原图走（requireOptional 保证各种加载方式下都能取到 require）
+    const sharp = requireOptional('sharp')
+    if (!sharp) {
+      log('warn', '送审图片过大但 sharp 不可用，按原图调用 AI', { size: buffer.length })
+      return { data: buffer, mime: 'image/png' }
+    }
+    // 逐级降采样直到 base64 落在网关可接受范围内。
+    // 只压一次 jpeg 并不总够：地图截图在高 deviceScaleFactor 下噪点极多，
+    // 实测 2560x4000 的 PNG 压成 q85 jpeg 后 base64 仍可能远超阈值；
+    // 而一旦网关拒收，requestAiImageCheck 会走异常分支返回 null 直接放行，等于白检。
+    const ladder = [
+      { width: 2560, quality: 85 },
+      { width: 1920, quality: 80 },
+      { width: 1280, quality: 75 },
+      { width: 960, quality: 70 },
+    ]
+    let best: { data: Buffer; mime: string } | null = null
+    let detail = ''
+    for (const step of ladder) {
+      try {
+        const data = await sharp(buffer)
+          .resize({ width: step.width, withoutEnlargement: true })
+          .jpeg({ quality: step.quality })
+          .toBuffer()
+        best = { data, mime: 'image/jpeg' }
+        if (data.length * 4 / 3 <= AI_MAX_BASE64_LENGTH) {
+          log('info', '送审图片过大，已压缩后再调用 AI', {
+            original: buffer.length, compressed: data.length, width: step.width, quality: step.quality,
+          })
+          return best
+        }
+        detail = `降至 ${step.width}px/q${step.quality} 后 base64 仍有 ${(data.length * 4 / 3 / 1e6).toFixed(1)}MB`
+      } catch (error: any) {
+        detail = error?.message || String(error)
+        break
+      }
+    }
+    // 取最小的一档交付（比丢几十 MB 的原图上去更可能被接受），失败则退回原图
+    if (best) {
+      log('warn', '送审图片压缩后仍超限，按最后一档调用 AI', { original: buffer.length, compressed: best.data.length, detail })
+      return best
+    }
+    log('warn', '送审图片压缩失败，按原图调用 AI', { error: detail, size: buffer.length })
+    return { data: buffer, mime: 'image/png' }
+  }
+
+  async function requestAiImageCheck(imageUrl: string, label: string): Promise<boolean | null> {
+    let apiUrl = config.aiApiUrl.trim()
+    // 兜底：自动补全 OpenAI 兼容的 chat/completions 路径，
+    // 避免用户只填到 /v1 而漏掉 /chat/completions 导致 404。
+    if (apiUrl && !/\/chat\/completions$/i.test(apiUrl)) {
+      apiUrl = apiUrl.replace(/\/+$/, '') + '/chat/completions'
+    }
+    const model = config.aiModel.trim()
+    if (!apiUrl || !model) {
+      log('warn', 'AI 图片合规识别已启用但未配置接口地址或模型', { label })
+      return null
+    }
+
+    const requestBody = {
+      model,
+      temperature: 0,
+      max_tokens: 20,
+      messages: [
+        { role: 'system', content: '你是图片合规审核引擎，只输出 BLOCK 或 PASS，不输出任何其他内容。' },
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: config.aiPrompt || DEFAULT_AI_PROMPT },
+            { type: 'image_url', image_url: { url: imageUrl } },
+          ],
+        },
+      ],
+    }
+    const apiKey = config.aiApiKey.trim()
+    const requestStartTime = Date.now()
+    // 请求日志：记录接口地址、模型、提示词长度与图片负载大小（不记录密钥与完整 base64）
+    log('info', 'AI 图片合规识别 API 请求', {
+      label,
+      url: apiUrl,
+      model,
+      hasApiKey: !!apiKey,
+      promptLength: (config.aiPrompt || DEFAULT_AI_PROMPT).length,
+      imagePayloadLength: imageUrl.length,
+      imagePayloadType: imageUrl.startsWith('data:') ? 'base64-data-url' : 'url',
+    })
+
+    try {
+      const response: any = await ctx.http.post(apiUrl, requestBody, {
+        timeout: config.aiTimeout,
+        headers: {
+          'Content-Type': 'application/json',
+          ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+        },
+      })
+      const duration = Date.now() - requestStartTime
+      // 响应日志：完整响应体（超长截断），并单独摘出模型输出与用量信息
+      log('info', 'AI 图片合规识别 API 响应', {
+        label,
+        duration,
+        response: stringifyForLog(response),
+        content: response?.choices?.[0]?.message?.content,
+        finishReason: response?.choices?.[0]?.finish_reason,
+        usage: stringifyForLog(response?.usage, 500),
+      })
+
+      const content = String(response?.choices?.[0]?.message?.content ?? '').trim().toUpperCase()
+      if (!content) {
+        log('warn', 'AI 图片合规识别返回空内容', { label, duration, response: stringifyForLog(response) })
+        return null
+      }
+      const blocked = content.includes('BLOCK') || content.includes('YES')
+      log('info', 'AI 图片合规识别完成', { label, blocked, duration, content: content.slice(0, 50) })
+      return blocked
+    } catch (error: any) {
+      // 识别服务不可用时放行并记录，避免 AI 故障导致整个查询不可用。
+      // 同时记录错误响应体，便于排查网关返回的具体错误。
+      log('error', 'AI 图片合规识别调用失败，本次放行', {
+        label,
+        url: apiUrl,
+        model,
+        duration: Date.now() - requestStartTime,
+        error: error.message,
+        status: error?.response?.status ?? error?.status,
+        responseData: stringifyForLog(error?.response?.data),
+      })
+      return null
+    }
+  }
+
+  /**
+   * 图片合规识别入口：buffer 或 URL 二选一。
+   * 远程图片优先下载为 base64（避免自定义网关无法访问外链），失败则直接传 URL。
+   * 结果按 cacheKey 缓存，避免同一图片反复调用 AI。
+   */
+  async function checkImageCompliance(
+    source: { buffer?: Buffer, url?: string },
+    cacheKey: string,
+    label: string,
+  ): Promise<boolean | null> {
+    if (!config.aiEnabled) return null
+    if (imageComplianceCache.has(cacheKey)) return imageComplianceCache.get(cacheKey)
+
+    let imageUrl: string | null = null
+    if (source.buffer) {
+      const prepared = await prepareImageForAi(source.buffer)
+      imageUrl = `data:${prepared.mime};base64,${prepared.data.toString('base64')}`
+    } else if (source.url) {
+      try {
+        const data = await ctx.http.get(source.url, {
+          timeout: config.timeout,
+          responseType: 'arraybuffer',
+          headers: { 'User-Agent': config.userAgent },
+        })
+        const buf = Buffer.from(data as ArrayBuffer)
+        // 同样过一遍体积治理：远程图也可能几 MB，超限会让网关拒收后静默放行
+        const prepared = await prepareImageForAi(buf)
+        imageUrl = `data:${prepared.mime};base64,${prepared.data.toString('base64')}`
+      } catch (error: any) {
+        log('warn', '下载待审核图片失败，改为直接传 URL 给 AI', { label, url: source.url, error: error.message })
+        imageUrl = source.url
+      }
+    }
+    if (!imageUrl) return null
+
+    const verdict = await requestAiImageCheck(imageUrl, label)
+    if (verdict !== null) {
+      if (imageComplianceCache.size > 500) imageComplianceCache.clear()
+      imageComplianceCache.set(cacheKey, verdict)
+    }
+    return verdict
   }
 
   // 读取绑定数据
@@ -543,6 +870,66 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
+  /**
+   * 解析被@用户的展示昵称。
+   * OneBot 的 at 段通常没有 name 属性，回退链：
+   * 1. 消息里自带的 name（at 标签 / 回复消息）；
+   * 2. 平台群成员接口（getGuildMember，OneBot 适配器映射 get_group_member_info 的群名片/昵称）；
+   * 3. OneBot 陌生人资料（get_stranger_info）；
+   * 4. 兜底直接展示 QQ 号，而不是「未知用户」。
+   */
+  async function resolveMentionName(session: Session, userId: string, fallbackName?: string | null): Promise<string> {
+    const fallback = fallbackName && fallbackName !== '未知用户' ? String(fallbackName).trim() : ''
+    if (fallback) return fallback
+
+    const bot: any = session?.bot
+    const guildId = session?.guildId || session?.channelId
+
+    try {
+      if (typeof bot?.getGuildMember === 'function' && guildId) {
+        const member = await bot.getGuildMember(guildId, userId)
+        const name = member?.nickname || member?.username || member?.user?.nickname || member?.user?.name
+        if (name) return String(name)
+      }
+    } catch (error: any) {
+      log('debug', '获取被@用户群名片失败', { userId, error: error?.message })
+    }
+
+    try {
+      const internal: any = bot?.internal
+      if (typeof internal?._get === 'function' && /^\d+$/.test(String(userId))) {
+        const info = await internal._get('get_stranger_info', { user_id: userId })
+        const name = info?.nickname || info?.nick
+        if (name) return String(name)
+      }
+    } catch (error: any) {
+      log('debug', '获取被@用户昵称（陌生人接口）失败', { userId, error: error?.message })
+    }
+
+    return userId ? String(userId) : '未知用户'
+  }
+
+  /**
+   * 提取 HTTP 错误的根因描述。cordis-http 的 "fetch ... failed" 只是把
+   * undici 的真实原因（超时/DNS/连接重置等）藏在 error.cause 里，
+   * 直接展示 message 无法定位问题。
+   */
+  function describeHttpError(error: any): string {
+    const parts: string[] = []
+    const message = String(error?.message || error || 'unknown error')
+    parts.push(message)
+    const cause = error?.cause ?? error?.errors?.[0]?.cause ?? error?.errors?.[0]
+    if (cause) {
+      const code = cause?.code || cause?.name
+      const causeMessage = cause?.message || String(cause)
+      if (code && !message.includes(code)) parts.push(`(${code})`)
+      if (causeMessage && causeMessage !== message && !message.includes(causeMessage)) parts.push(causeMessage)
+    }
+    const status = error?.response?.status ?? error?.status
+    if (status && !parts.some(p => p.includes(String(status)))) parts.push(`HTTP ${status}`)
+    return parts.filter(Boolean).join(' ').slice(0, 300)
+  }
+
   async function requestVolanta<T>(url: string): Promise<T> {
     let lastError: unknown
     for (let attempt = 0; attempt <= config.retryCount; attempt++) {
@@ -558,11 +945,12 @@ export function apply(ctx: Context, config: Config) {
         lastError = error
         if (attempt >= config.retryCount) break
         const delay = 1000 * 2 ** attempt
-        log('warn', 'Volanta request failed; retrying.', { url, attempt: attempt + 1, delay })
+        log('warn', 'Volanta request failed; retrying.', { url, attempt: attempt + 1, delay, reason: describeHttpError(error) })
         await new Promise(resolve => setTimeout(resolve, delay))
       }
     }
-    throw lastError
+    // 把根因带进最终抛出的错误，命令层的「查询失败: ...」能直接看到原因
+    throw new Error(describeHttpError(lastError))
   }
 
   async function fetchProfileByNetworkUserName(networkUserName: string): Promise<VolantaProfileResponse | null> {
@@ -853,6 +1241,18 @@ export function apply(ctx: Context, config: Config) {
       return null
     }
 
+    // 接口近期失败时跳过本次获取：避免机场接口异常（如超时）拖慢每一次查询。
+    // 中文名只是附加信息，失败 10 分钟内直接降级为纯 ICAO 输出。
+    const failedAt = airportFailCache.get(icao)
+    if (failedAt && Date.now() - failedAt < AIRPORT_FAIL_TTL) {
+      log('debug', '机场信息接口近期失败，跳过本次获取', {
+        icao,
+        failAge: Date.now() - failedAt,
+        failTtl: AIRPORT_FAIL_TTL,
+      })
+      return null
+    }
+
     // 检查缓存
     const cached = airportCache.get(icao)
     if (cached && Date.now() - cached.lastUpdated < 24 * 60 * 60 * 1000) { // 缓存24小时
@@ -872,67 +1272,95 @@ export function apply(ctx: Context, config: Config) {
       })
     }
 
-    try {
-      log('debug', '开始请求xflysim机场API', { 
-        icao,
-        url: `https://api.xflysim.com/pilot/api/realTimeMap/airports/${icao}` 
-      })
-      
-      const response = await ctx.http.get(`https://api.xflysim.com/pilot/api/realTimeMap/airports/${icao}`, {
-        timeout: config.timeout,
-        headers: {
-          'User-Agent': config.userAgent
+    // 疑似抖动（偶发超时/网络错误）时立即重试一次；重试仍失败才进入失败缓存
+    const maxAttempts = 2
+    let lastError: any
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        if (attempt > 1) {
+          log('info', '机场信息接口疑似抖动，重试一次', { icao, attempt })
+          await new Promise(res => setTimeout(res, 500))
         }
-      }) as XflysimAirportResponse
-
-      log('debug', '收到xflysim API响应', { 
-        icao,
-        code: response.code,
-        hasData: !!response.data 
-      })
-
-      if (response.code === 20000 && response.data) {
-        const airportInfo: AirportInfo = {
+        log('debug', '开始请求xflysim机场API', {
           icao,
-          cnName: response.data.cnName,
-          enName: response.data.enName,
-          iataCode: response.data.iataCode,
-          municipalityCn: response.data.municipalityCn,
-          lastUpdated: Date.now()
-        }
-        
-        // 更新缓存
-        log('debug', '更新机场信息缓存', { 
-          icao, 
-          cnName: response.data.cnName,
-          iataCode: response.data.iataCode 
+          attempt,
+          url: `https://api.xflysim.com/pilot/api/realTimeMap/airports/${icao}`
         })
-        airportCache.set(icao, airportInfo)
-        
-        log('info', '成功获取机场中文名称', { 
-          icao, 
-          cnName: response.data.cnName 
-        })
-        return {
-          cnName: response.data.cnName,
-          iataCode: response.data.iataCode
-        }
-      } else {
-        log('warn', '获取机场信息API返回错误', { 
-          icao, 
+
+        const response = await ctx.http.get(`https://api.xflysim.com/pilot/api/realTimeMap/airports/${icao}`, {
+          // 机场中文名是附加信息，使用独立的短超时，避免接口异常时拖慢整个查询
+          timeout: config.airportApiTimeout,
+          headers: {
+            'User-Agent': config.userAgent
+          }
+        }) as XflysimAirportResponse
+
+        log('debug', '收到xflysim API响应', {
+          icao,
+          attempt,
           code: response.code,
-          message: response.message 
+          hasData: !!response.data
         })
-        return null
+
+        if (response.code === 20000 && response.data) {
+          const airportInfo: AirportInfo = {
+            icao,
+            cnName: response.data.cnName,
+            enName: response.data.enName,
+            iataCode: response.data.iataCode,
+            municipalityCn: response.data.municipalityCn,
+            lastUpdated: Date.now()
+          }
+
+          // 更新缓存
+          log('debug', '更新机场信息缓存', {
+            icao,
+            cnName: response.data.cnName,
+            iataCode: response.data.iataCode
+          })
+          airportCache.set(icao, airportInfo)
+          // 请求成功，清除失败标记
+          airportFailCache.delete(icao)
+
+          log('info', '成功获取机场中文名称', {
+            icao,
+            cnName: response.data.cnName,
+            attempt
+          })
+          return {
+            cnName: response.data.cnName,
+            iataCode: response.data.iataCode
+          }
+        } else {
+          log('warn', '获取机场信息API返回错误', {
+            icao,
+            code: response.code,
+            message: response.message
+          })
+          return null
+        }
+      } catch (error: any) {
+        lastError = error
+        log('warn', '获取机场信息请求失败', {
+          icao,
+          attempt,
+          error: error.message,
+          timeout: config.airportApiTimeout
+        })
       }
-    } catch (error: any) {
-      log('error', '获取机场信息时发生错误', { 
-        icao, 
-        error: error.message,
-        stack: error.stack 
-      })
-      return null
     }
+
+    // 重试后仍失败：记录失败标记，10 分钟内不再重试该机场，避免超时反复拖慢查询
+    airportFailCache.set(icao, Date.now())
+    log('error', '获取机场信息重试后仍失败，短期内不再重试', {
+      icao,
+      attempts: maxAttempts,
+      error: lastError?.message,
+      timeout: config.airportApiTimeout,
+      failTtl: AIRPORT_FAIL_TTL,
+      stack: lastError?.stack
+    })
+    return null
   }
 
 
@@ -951,6 +1379,47 @@ export function apply(ctx: Context, config: Config) {
       return icao
     }
   }
+
+  /**
+   * 从磁盘恢复上次成功抓取的汇总航班数据。
+   * 只作为兜底数据（不参与缓存有效期判断），用于上游超时/插件重载后的首次查询。
+   */
+  function loadFlightCacheFromDisk(): void {
+    try {
+      if (!existsSync(flightCacheFilePath)) return
+      const raw = JSON.parse(readFileSync(flightCacheFilePath, 'utf8'))
+      if (!raw || !Array.isArray(raw.data) || !raw.data.length) return
+      flightCache = {
+        data: raw.data as VolantaFlight[],
+        timestamp: typeof raw.savedAt === 'number' ? raw.savedAt : Date.now(),
+        fromDisk: true,
+      }
+      log('info', '已从磁盘加载航班数据兜底缓存', {
+        flights: flightCache.data.length,
+        age: Date.now() - flightCache.timestamp,
+        file: flightCacheFilePath,
+      })
+    } catch (error: any) {
+      log('warn', '读取磁盘航班数据缓存失败', { error: error?.message || String(error) })
+    }
+  }
+
+  /** 成功抓取后把汇总数据落盘（节流），供下次启动/上游超时兜底。 */
+  function saveFlightCacheToDisk(data: VolantaFlight[]): void {
+    const now = Date.now()
+    if (now - lastFlightCacheSavedAt < FLIGHT_CACHE_SAVE_INTERVAL) return
+    lastFlightCacheSavedAt = now
+    try {
+      mkdirSync(resolve(flightCacheFilePath, '..'), { recursive: true })
+      writeFileSync(flightCacheFilePath, JSON.stringify({ savedAt: now, data }), 'utf8')
+      log('debug', '航班数据已落盘', { flights: data.length, file: flightCacheFilePath })
+    } catch (error: any) {
+      log('warn', '航班数据落盘失败', { error: error?.message || String(error) })
+    }
+  }
+
+  // 启动时先把上次的数据装载为兜底缓存
+  loadFlightCacheFromDisk()
 
   // 检查缓存是否有效
   function isCacheValid(cache: FlightCache | null): cache is FlightCache {
@@ -981,7 +1450,7 @@ export function apply(ctx: Context, config: Config) {
   // 获取所有航班数据的函数 - 强制刷新版本
   async function fetchAllFlights(forceRefresh: boolean = false): Promise<VolantaFlight[]> {
     log('debug', '开始获取所有航班数据', { forceRefresh, configForceRefresh: config.forceRefresh })
-    
+
     // 检查缓存是否有效（考虑强制刷新设置）
     const cachedFlight = flightCache
     if (!forceRefresh && isCacheValid(cachedFlight)) {
@@ -996,16 +1465,35 @@ export function apply(ctx: Context, config: Config) {
       reason: forceRefresh ? '强制刷新' : '缓存无效',
       cacheExists: !!flightCache 
     })
-    
+
+    // 并发去重：同时到来的多个查询共用同一次下载，避免重复拉取约 3MB
+    if (flightFetchInFlight) {
+      log('info', '已有航班数据请求在进行中，复用该请求')
+      return flightFetchInFlight
+    }
+    flightFetchInFlight = fetchAllFlightsFromApi()
+    try {
+      return await flightFetchInFlight
+    } finally {
+      flightFetchInFlight = null
+    }
+  }
+
+  /** 真正发起上游请求的部分（含重试与兜底），由 fetchAllFlights 负责并发去重。 */
+  async function fetchAllFlightsFromApi(): Promise<VolantaFlight[]> {
+    // 该 JSON 约 3MB，上游 Cloudflare（cf-cache-status: DYNAMIC）不缓存、每次回源，
+    // 网络抖动时单次下载可能 30~60 秒，因此单独使用 dataTimeout。
+    const dataTimeout = Math.max(config.dataTimeout || 0, config.timeout || 0, 60000)
+
     for (let attempt = 1; attempt <= config.retryCount + 1; attempt++) {
       try {
-        log('info', `开始第 ${attempt} 次尝试获取航班数据`)
+        log('info', `开始第 ${attempt} 次尝试获取航班数据`, { timeout: dataTimeout })
         
         const requestStartTime = Date.now()
         log('debug', '发送HTTP请求到Volanta API')
         
         const response = await ctx.http.get('https://webassets.volanta.app/volanta-flight-positions.json', {
-          timeout: config.timeout,
+          timeout: dataTimeout,
           headers: {
             'User-Agent': config.userAgent
           }
@@ -1057,6 +1545,8 @@ export function apply(ctx: Context, config: Config) {
           data: flights,
           timestamp: Date.now()
         }
+        // 落盘兜底（节流），供插件重载/上游超时时使用
+        saveFlightCacheToDisk(flights)
         
         log('debug', '更新航班数据缓存', { 
           flightCount: flights.length,
@@ -1066,22 +1556,39 @@ export function apply(ctx: Context, config: Config) {
         return flights
         
       } catch (error: any) {
+        const isTimeout = /timeout|ETIMEDOUT|aborted/i.test(error?.message || '')
         log('error', `第 ${attempt} 次获取航班数据失败`, { 
           attempt,
+          timeout: dataTimeout,
+          isTimeout,
           error: error.message,
           stack: error.stack 
         })
-        
-        if (attempt === config.retryCount + 1) {
-          // 最后一次失败时，如果有缓存数据则返回缓存
+
+        // 超时基本都是上游/链路拥塞，重试同样要等满一个超时周期（会让用户干等几分钟），
+        // 因此超时直接放弃剩余重试、走兜底缓存。
+        if (attempt === config.retryCount + 1 || isTimeout) {
+          if (isTimeout && attempt < config.retryCount + 1) {
+            log('warn', '上游请求超时，跳过剩余重试直接使用兜底数据', { attempt })
+          }
+          // 有缓存数据则返回缓存（含磁盘兜底数据）
           if (flightCache) {
             log('warn', '所有尝试失败，使用过期的缓存数据作为备选', { 
               cacheAge: Date.now() - flightCache.timestamp,
-              flightCount: flightCache.data.length 
+              flightCount: flightCache.data.length,
+              fromDisk: !!flightCache.fromDisk,
             })
             return flightCache.data
           }
-          log('error', '所有尝试失败且无缓存数据可用')
+          log('error', '所有尝试失败且无缓存数据可用', { attempts: attempt, error: error.message })
+          // 超时类错误给用户一句可读的提示，避免直接抛出 'request timeout'
+          if (isTimeout) {
+            const friendly = new Error(
+              `Volanta 实时数据接口响应超时（上游 Cloudflare 每次回源、网络较慢），已尝试 ${attempt} 次仍失败，请稍后重试`
+            )
+            ;(friendly as any).cause = error
+            throw friendly
+          }
           throw error
         }
         
@@ -1228,18 +1735,10 @@ export function apply(ctx: Context, config: Config) {
   }
 
   // 截图函数
-  async function captureFlightScreenshot(flight: VolantaFlight, attempt: number = 1): Promise<Buffer | null> {
-    if (isBlockedAircraftRegistration(flight.aircraftRegistration)) {
-      log('info', '注册号匹配图片拦截规则，已跳过 Volanta 截图', {
-        flightId: flight.id,
-        callsign: flight.callsign,
-        aircraftRegistration: flight.aircraftRegistration,
-      })
-      return null
-    }
-    log('debug', '开始截图流程', { 
+  async function captureFlightScreenshot(flight: VolantaFlight): Promise<Buffer | null> {
+    log('debug', '开始截图流程', {
       flightId: flight.id,
-      callsign: flight.callsign 
+      callsign: flight.callsign
     })
     
     if (!ctx.puppeteer) {
@@ -1247,175 +1746,239 @@ export function apply(ctx: Context, config: Config) {
       return null
     }
 
-    log('debug', 'Puppeteer服务可用，开始创建页面')
-    const page = await ctx.puppeteer.page()
-
-    // 跟踪加载失败的资源，便于诊断白屏原因
-    const failedRequests: string[] = []
-    ;(page as any).on?.('requestfailed', (request: any) => {
-      if (failedRequests.length < 20) {
-        failedRequests.push(`${request.failure()?.errorText || 'failed'} ${String(request.url()).slice(0, 120)}`)
-      }
-    })
-
     const maxAttempts = Math.max(1, (config.retryCount || 0) + 1)
-    let blankDetected = false
+    // 截图缩放倍数（deviceScaleFactor）：放大截图像素密度，让画面里的小图标/文字
+    // 在 AI 识别时有更多像素可用，群内查看也更清晰。
+    const deviceScaleFactor = Math.max(1, config.zoomLevel || 1)
 
-    try {
-      log('debug', '设置页面视窗', { 
-        width: config.viewportWidth, 
-        height: config.viewportHeight 
-      })
-      await page.setViewport({ 
-        width: Math.max(320, config.viewportWidth), 
-        height: Math.max(320, config.viewportHeight) 
-      })
-      
-      log('debug', '设置User-Agent', { userAgent: config.userAgent })
-      await page.setUserAgent(config.userAgent)
-      
-      const flightUrl = `https://fly.volanta.app/flights/${flight.id}/stats`
-      log('info', '导航到航班页面', { url: flightUrl })
-      
-      await page.goto(flightUrl, { 
-        waitUntil: 'domcontentloaded',
-        timeout: config.timeout 
-      })
-      
-      log('debug', '页面加载完成，等待3秒确保内容渲染')
-      await new Promise(res => setTimeout(res, 3000))
-      
-      // 尝试点击关注按钮
-      const followButtonXPath = '/html/body/app-root/div/app-flight-view/div/div/app-flight-card-header/div/ul[3]/li[2]/a/img'
-      log('debug', '尝试查找关注按钮', { xpath: followButtonXPath })
-      
+    // Volanta 是 SPA，domcontentloaded 时 React 往往尚未渲染。轮询等待页面出现
+    // 实际文本内容，可以显著降低「固定等待不够长导致的空白截图」概率。
+    const waitForContent = async (page: any): Promise<boolean> => {
+      const deadline = Date.now() + 10_000
+      while (Date.now() < deadline) {
+        const textLength = await page.evaluate(() => (document.body?.innerText || '').trim().length).catch(() => 0)
+        if (textLength >= 100) return true
+        await new Promise(res => setTimeout(res, 500))
+      }
+      return false
+    }
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      let blankDetected = false
+      let page: any = null
       try {
-        const findElementByXPath = async (xpath: string) => {
-          return await page.evaluate((xpath) => {
-            const result = document.evaluate(
-              xpath, 
-              document, 
-              null, 
-              XPathResult.FIRST_ORDERED_NODE_TYPE, 
-              null
-            )
-            return result.singleNodeValue
-          }, xpath)
+        log('debug', 'Puppeteer服务可用，开始创建页面', { attempt, maxAttempts })
+        page = await ctx.puppeteer.page()
+
+        // 跟踪加载失败的资源，便于诊断白屏原因
+        const failedRequests: string[] = []
+        page.on?.('requestfailed', (request: any) => {
+          if (failedRequests.length < 20) {
+            failedRequests.push(`${request.failure()?.errorText || 'failed'} ${String(request.url()).slice(0, 120)}`)
+          }
+        })
+
+        log('debug', '设置页面视窗', {
+          width: config.viewportWidth,
+          height: config.viewportHeight,
+          deviceScaleFactor: deviceScaleFactor,
+        })
+        await page.setViewport({
+          width: Math.max(320, config.viewportWidth),
+          height: Math.max(320, config.viewportHeight),
+          deviceScaleFactor,
+        })
+        
+        log('debug', '设置User-Agent', { userAgent: config.userAgent })
+        await page.setUserAgent(config.userAgent)
+        
+        const flightUrl = `https://fly.volanta.app/flights/${flight.id}/stats`
+        log('info', '导航到航班页面', { url: flightUrl })
+        
+        await page.goto(flightUrl, { 
+          waitUntil: 'domcontentloaded',
+          timeout: config.timeout 
+        })
+
+        const contentReady = await waitForContent(page)
+        if (!contentReady) log('warn', '页面内容等待超时，继续截图流程', { attempt })
+        
+        log('debug', '页面加载完成，等待3秒确保内容渲染')
+        await new Promise(res => setTimeout(res, 3000))
+        
+        // 尝试点击定位按钮（把地图居中到航班当前位置）
+        // 说明：
+        // - XPath 选中的可能是 <a> 里的 <img>，直接 click img 未必触发 Angular 绑定
+        //   在 <a> 上的点击处理器，因此统一冒泡点击其父级 <a>；
+        // - 按钮可能晚于页面文本渲染，使用轮询（最长 8 秒）而不是只查一次；
+        // - page.evaluate 返回 DOM 节点会被序列化成空对象，因此查找与点击必须在
+        //   evaluate 内部一次完成，只向 Node 侧返回布尔值。
+        const locateButtonXPaths = [
+          '/html/body/app-root/div/app-flight-view/div/div/app-flight-card-header/div/ul[3]/li[2]/a/img',
+          '/html/body/app-root/div/app-flight-view/div/div/app-flight-card-header/div/ul[3]/li[2]/a',
+        ]
+        log('debug', '尝试查找定位按钮', { xpaths: locateButtonXPaths })
+
+        const clickLocateButton = async (targetPage: any, xpaths: string[], waitMs: number): Promise<boolean> => {
+          const deadline = Date.now() + waitMs
+          while (Date.now() < deadline) {
+            const clicked = await targetPage.evaluate((selectors: string[]) => {
+              for (const xpath of selectors) {
+                try {
+                  const result = document.evaluate(
+                    xpath,
+                    document,
+                    null,
+                    XPathResult.FIRST_ORDERED_NODE_TYPE,
+                    null,
+                  )
+                  const node = result.singleNodeValue as HTMLElement | null
+                  if (!node) continue
+                  // 优先点击承载点击处理器的 <a>，其次才是命中的元素本身
+                  const target = ((node as any).closest?.('a') as HTMLElement) || node
+                  const rect = target.getBoundingClientRect()
+                  const options: MouseEventInit = {
+                    bubbles: true,
+                    cancelable: true,
+                    view: window,
+                    clientX: rect.left + rect.width / 2,
+                    clientY: rect.top + rect.height / 2,
+                  }
+                  // 完整的鼠标事件序列，兼容监听 mousedown/mouseup 的框架
+                  for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'] as const) {
+                    const EventCtor = type.startsWith('pointer') && typeof PointerEvent === 'function' ? PointerEvent : MouseEvent
+                    target.dispatchEvent(new EventCtor(type, options))
+                  }
+                  return true
+                } catch {
+                  continue
+                }
+              }
+              return false
+            }, xpaths).catch((error: any) => {
+              log('warn', '定位按钮点击执行出错', { error: error?.message || String(error) })
+              return false
+            })
+            if (clicked) return true
+            await new Promise(res => setTimeout(res, 500))
+          }
+          return false
         }
+
+        try {
+          const clicked = await clickLocateButton(page, locateButtonXPaths, 8000)
+          if (clicked) {
+            log('info', '定位按钮已点击，等待地图重新居中')
+          } else {
+            log('warn', '未找到定位按钮，跳过地图定位', { xpaths: locateButtonXPaths })
+          }
+        } catch (error: any) {
+          log('warn', '点击定位按钮失败，继续截图', { error: error.message })
+        }
+
+        log('debug', '定位操作完成，等待2秒')
+        await new Promise(res => setTimeout(res, 2000))
         
-        const followButton = await findElementByXPath(followButtonXPath)
-        
-        if (followButton) {
-          log('info', '找到关注按钮，正在点击')
-          await page.evaluate((xpath) => {
-            const result = document.evaluate(
-              xpath, 
-              document, 
-              null, 
-              XPathResult.FIRST_ORDERED_NODE_TYPE, 
-              null
-            )
-            const element = result.singleNodeValue as HTMLElement
-            if (element) {
-              element.click()
+        log('info', `等待地图加载 ${config.screenshotDelay}ms`)
+        await new Promise(res => setTimeout(res, config.screenshotDelay))
+
+        // Wait for all document images to decode and for two paint frames, so slow
+        // image loads do not leave blank placeholders in the screenshot.
+        await page.evaluate(async () => {
+          const images = Array.from(document.images)
+          await Promise.all(images.map(async (image) => {
+            if (!image.complete) {
+              await Promise.race([
+                new Promise<void>((resolve) => {
+                  image.addEventListener('load', () => resolve(), { once: true })
+                  image.addEventListener('error', () => resolve(), { once: true })
+                }),
+                new Promise<void>((resolve) => setTimeout(resolve, 10_000)),
+              ])
             }
-          }, followButtonXPath)
-          log('debug', '关注按钮点击完成，等待2秒')
-          await new Promise(res => setTimeout(res, 2000))
+            if (image.naturalWidth > 0) {
+              try {
+                await image.decode()
+              } catch {
+                // A broken image must not block the whole screenshot.
+              }
+            }
+          }))
+          await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
+        })
+
+        const contentWidth = await page.evaluate(() => Math.ceil(Math.max(
+          document.documentElement.scrollWidth,
+          document.body.scrollWidth,
+        )))
+        await page.setViewport({
+          width: Math.min(Math.max(320, config.viewportWidth, contentWidth), 4096),
+          height: Math.max(320, config.viewportHeight),
+          deviceScaleFactor,
+        })
+        await page.evaluate(() => window.dispatchEvent(new Event('resize')))
+        await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
+        
+        // 渲染健康检查：页面 JS 加载失败时 React 无法渲染，整页截图会接近纯白
+        const renderState = await page.evaluate(() => ({
+          textLength: (document.body?.innerText || '').trim().length,
+          images: document.images.length,
+          imagesLoaded: Array.from(document.images).filter(img => img.naturalWidth > 0).length,
+        }))
+
+        log('debug', '开始截图')
+        const screenshotStartTime = Date.now()
+        const screenshot = await page.screenshot({ 
+          type: 'png',
+          fullPage: true
+        }) as Buffer
+        const screenshotDuration = Date.now() - screenshotStartTime
+
+        // 空白检测：页面完全未渲染时整页 PNG 体积极小（正常渲染远大于该阈值）
+        if (screenshot.length < 20000 && renderState.textLength < 50) {
+          blankDetected = true
+          log('warn', '截图疑似空白页面（页面未完成渲染）', {
+            size: screenshot.length,
+            renderState,
+            failedRequests,
+            attempt,
+            maxAttempts,
+          })
         } else {
-          log('debug', '未找到关注按钮，继续截图')
+          log('info', '截图完成', {
+            duration: screenshotDuration,
+            size: screenshot.length,
+            deviceScaleFactor,
+            attempt,
+          })
+          return screenshot
         }
       } catch (error: any) {
-        log('warn', '点击关注按钮失败，继续截图', { error: error.message })
-      }
-      
-      log('info', `等待地图加载 ${config.screenshotDelay}ms`)
-      await new Promise(res => setTimeout(res, config.screenshotDelay))
-
-      // Wait for all document images to decode and for two paint frames, so slow
-      // image loads do not leave blank placeholders in the screenshot.
-      await page.evaluate(async () => {
-        const images = Array.from(document.images)
-        await Promise.all(images.map(async (image) => {
-          if (!image.complete) {
-            await Promise.race([
-              new Promise<void>((resolve) => {
-                image.addEventListener('load', () => resolve(), { once: true })
-                image.addEventListener('error', () => resolve(), { once: true })
-              }),
-              new Promise<void>((resolve) => setTimeout(resolve, 10_000)),
-            ])
-          }
-          if (image.naturalWidth > 0) {
-            try {
-              await image.decode()
-            } catch {
-              // A broken image must not block the whole screenshot.
-            }
-          }
-        }))
-        await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))
-      })
-
-      const contentWidth = await page.evaluate(() => Math.ceil(Math.max(
-        document.documentElement.scrollWidth,
-        document.body.scrollWidth,
-      )))
-      await page.setViewport({
-        width: Math.min(Math.max(320, config.viewportWidth, contentWidth), 4096),
-        height: Math.max(320, config.viewportHeight),
-      })
-      await page.evaluate(() => window.dispatchEvent(new Event('resize')))
-      await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
-      
-      // 渲染健康检查：页面 JS 加载失败时 React 无法渲染，整页截图会接近纯白
-      const renderState = await page.evaluate(() => ({
-        textLength: (document.body?.innerText || '').trim().length,
-        images: document.images.length,
-        imagesLoaded: Array.from(document.images).filter(img => img.naturalWidth > 0).length,
-      }))
-
-      log('debug', '开始截图')
-      const screenshotStartTime = Date.now()
-      const screenshot = await page.screenshot({ 
-        type: 'png',
-        fullPage: true
-      }) as Buffer
-      const screenshotDuration = Date.now() - screenshotStartTime
-
-      // 空白检测：页面完全未渲染时整页 PNG 体积极小（正常渲染远大于该阈值）
-      if (screenshot.length < 20000 && renderState.textLength < 50) {
-        blankDetected = true
-        log('warn', '截图疑似空白页面（页面未完成渲染）', {
-          size: screenshot.length,
-          renderState,
-          failedRequests,
+        // 偶发的导航超时 / 协议错误 / 页面创建失败同样纳入重试，
+        // 而不是直接放弃整个截图。
+        log('error', '截图过程中发生错误', { 
+          error: error.message,
+          stack: error.stack,
           attempt,
           maxAttempts,
         })
-      } else {
-        log('info', '截图完成', { 
-          duration: screenshotDuration,
-          size: screenshot.length 
-        })
-        return screenshot
+      } finally {
+        if (page) {
+          log('debug', '关闭页面')
+          // 关闭失败不应掩盖真正的截图错误。
+          await page.close().catch((error: any) => log('warn', '关闭页面失败', { error: error?.message }))
+        }
       }
-      
-    } catch (error: any) {
-      log('error', '截图过程中发生错误', { 
-        error: error.message,
-        stack: error.stack 
-      })
-      return null
-    } finally {
-      log('debug', '关闭页面')
-      await page.close()
-    }
 
-    // 空白重试：网络抖动导致页面 JS 未加载时通常重试即可恢复
-    if (blankDetected && attempt < maxAttempts) {
-      log('info', '空白截图，正在重试', { nextAttempt: attempt + 1, maxAttempts })
-      return captureFlightScreenshot(flight, attempt + 1)
+      if (attempt < maxAttempts) {
+        const delay = 1000 * attempt
+        log('info', blankDetected ? '空白截图，正在重试' : '截图失败，正在重试', {
+          nextAttempt: attempt + 1,
+          maxAttempts,
+          delay,
+        })
+        await new Promise(res => setTimeout(res, delay))
+      }
     }
     return null
   }
@@ -1525,27 +2088,43 @@ export function apply(ctx: Context, config: Config) {
     })
     
     const { baseInfo, routeInfo } = await buildFlightInfo(flight)
-    if (isBlockedAircraftRegistration(flight.aircraftRegistration)) {
-      return { mainMessage: [baseInfo], routeMessage: routeInfo }
+
+    // AI 图片合规识别：截图命中违规内容时拦截图片，仅保留文字信息
+    let imageBlocked = false
+    if (screenshot) {
+      const verdict = await checkImageCompliance(
+        { buffer: screenshot },
+        `screenshot:${flight.id}`,
+        `航班截图 ${flight.callsign || flight.id}`,
+      )
+      if (verdict === true) {
+        imageBlocked = true
+        log('warn', '航班截图命中违规内容，已拦截', { flightId: flight.id, callsign: flight.callsign })
+      }
     }
-    
+    const effectiveScreenshot = imageBlocked ? null : screenshot
+
     let mainMessage: any[]
     switch (config.outputFormat) {
       case OutputFormat.IMAGE_ONLY:
         log('debug', '使用IMAGE_ONLY输出格式')
-        mainMessage = screenshot ? [h.image(screenshot, 'image/png')] : ['截图失败，请稍后重试。']
+        mainMessage = effectiveScreenshot
+          ? [h.image(effectiveScreenshot, 'image/png')]
+          : [imageBlocked ? AI_BLOCK_NOTICE : '截图失败，请稍后重试。']
         break
-      
+
       case OutputFormat.TEXT_ONLY:
         log('debug', '使用TEXT_ONLY输出格式')
         mainMessage = [baseInfo]
         break
-      
+
       case OutputFormat.BOTH:
       default:
         log('debug', '使用BOTH输出格式')
-        if (screenshot) {
-          mainMessage = [h.image(screenshot, 'image/png'), '\n' + baseInfo]
+        if (effectiveScreenshot) {
+          mainMessage = [h.image(effectiveScreenshot, 'image/png'), '\n' + baseInfo]
+        } else if (imageBlocked) {
+          mainMessage = [`${AI_BLOCK_NOTICE}\n${baseInfo}`]
         } else {
           mainMessage = ['截图失败，以下是航班信息：\n' + baseInfo]
         }
@@ -1849,12 +2428,16 @@ const queryCmd = ctx.command('volanta查询 [target]', '查询被@用户、呼�
     
     // 如果有@用户，优先使用@用户
     if (targetUserId) {
-      log('info', '处理@用户查询请求', { 
-        targetUserId, 
-        targetUserName 
+      log('info', '处理@用户查询请求', {
+        targetUserId,
+        targetUserName
       })
-      
+
       try {
+        // at 段通常没有 name 属性，先解析真实昵称，避免输出「未知用户」
+        targetUserName = await resolveMentionName(session, targetUserId, targetUserName)
+        log('info', '被@用户昵称解析完成', { targetUserId, targetUserName })
+
         await session.send(`正在查询 ${targetUserName} 的飞行状态，请稍候...`)
 
         // 检查用户是否已绑定 - 使用被@用户的QQ号获取绑定
@@ -2121,6 +2704,8 @@ const queryCmd = ctx.command('volanta查询 [target]', '查询被@用户、呼�
       }
 
       if (targetUserId) {
+        // at 段通常没有 name 属性，先解析真实昵称，避免输出「未知用户」
+        targetUserName = await resolveMentionName(session, targetUserId, targetUserName)
         const binding = getUserBinding(targetUserId)
         if (!binding) {
           return `❌ ${targetUserName || '该用户'} 尚未绑定Volanta账户。\n\n💡 请先使用"volanta绑定 <用户名>"命令进行绑定。`
@@ -2158,49 +2743,68 @@ const queryCmd = ctx.command('volanta查询 [target]', '查询被@用户、呼�
 
         const { summary } = buildProfileInfoMessage(profile)
 
+        // 大合并转发：头像 + 用户信息 + 最近航班打包为一条合并转发消息
+        const allNodes: ForwardNode[] = []
+
+        // 节点1：头像（AI 合规识别，命中违规内容时拦截）
         if (profile.profileImage && profile.profileImage !== 'null') {
-          try {
-            await session.send(h.image(profile.profileImage))
-          } catch (error: any) {
-            // Remote image fetching is performed by the OneBot implementation
-            // and may fail independently of the profile query. Keep sending
-            // the textual profile rather than failing the whole command.
-            log('warn', 'Failed to send Volanta profile image; continuing without it.', {
-              error: error?.message || String(error),
-            })
+          const verdict = await checkImageCompliance(
+            { url: profile.profileImage },
+            `avatar:${profile.id}`,
+            `头像 ${profile.userName || profile.id}`,
+          )
+          if (verdict === true) {
+            log('warn', '用户头像命中违规内容，已拦截', { profileId: profile.id })
+            allNodes.push({ message: `🚫 该用户头像包含违反一个中国原则的内容，已被拦截。` })
+          } else {
+            allNodes.push({ message: h.image(profile.profileImage) })
           }
         }
-        await session.send(summary)
 
-        await session.send(`正在查询 ${networkUserName} 的最近航班，请稍候...`)
+        // 节点2：用户信息
+        allNodes.push({ message: summary })
+
+        // 节点3+：最近航班
         let recentFlights = await fetchRecentFlightsByUserKey(queryKey!)
         if (!recentFlights.length && networkUserName && queryKey !== networkUserName) {
           recentFlights = await fetchRecentFlightsByUserKey(networkUserName)
         }
 
         if (!recentFlights.length) {
-          return `ℹ️ ${networkUserName} 暂无可用的最近航班记录。`
+          allNodes.push({ message: `ℹ️ ${networkUserName} 暂无可用的最近航班记录。` })
+        } else {
+          const sortedFlights = [...recentFlights]
+            .sort((a, b) => {
+              const ta = Date.parse(a.updatedAt || '') || 0
+              const tb = Date.parse(b.updatedAt || '') || 0
+              return tb - ta
+            })
+            .slice(0, 5)
+
+          for (const flight of sortedFlights) {
+            const index = sortedFlights.indexOf(flight)
+            const text = buildRecentFlightMessage(flight, index, sortedFlights.length)
+            const imageUrl = flight.aircraft?.imageUrl || flight.imageUrl || null
+            if (imageUrl && imageUrl !== 'null') {
+              // AI 合规识别：命中违规配图时仅保留文字并附拦截提示
+              const verdict = await checkImageCompliance(
+                { url: imageUrl },
+                `aircraft:${imageUrl}`,
+                `配图 ${flight.callsign || flight.aircraftRegistration || flight.id || imageUrl.slice(0, 60)}`,
+              )
+              if (verdict === true) {
+                log('warn', '飞机配图命中违规内容，已拦截', { flightId: flight.id, imageUrl: imageUrl.slice(0, 120) })
+                allNodes.push({ message: `${text}\n${AI_BLOCK_NOTICE}` })
+                continue
+              }
+              allNodes.push({ message: [text, '\n', h.image(imageUrl)] as Fragment })
+              continue
+            }
+            allNodes.push({ message: text })
+          }
         }
 
-        const sortedFlights = [...recentFlights]
-          .sort((a, b) => {
-            const ta = Date.parse(a.updatedAt || '') || 0
-            const tb = Date.parse(b.updatedAt || '') || 0
-            return tb - ta
-          })
-          .slice(0, 5)
-
-        const nodes: ForwardNode[] = sortedFlights.map((flight, index) => {
-          const text = buildRecentFlightMessage(flight, index, sortedFlights.length)
-          const imageUrl = flight.aircraft?.imageUrl || flight.imageUrl || null
-          const isOneBot = session.platform === 'onebot' || (session.bot as any)?.platform === 'onebot'
-          if (!isOneBot && imageUrl && imageUrl !== 'null' && !isBlockedAircraftRegistration(flight.aircraftRegistration)) {
-            return { message: [text, '\n', h.image(imageUrl)] as Fragment }
-          }
-          return { message: text as Fragment }
-        })
-
-        await sendMergedForwardNodes(session, nodes)
+        await sendMergedForwardNodes(session, allNodes)
       } catch (error: any) {
         log('error', 'volanta信息查询失败', {
           queryKey,
@@ -2208,7 +2812,21 @@ const queryCmd = ctx.command('volanta查询 [target]', '查询被@用户、呼�
           error: error.message,
           stack: error.stack,
         })
-        return `❌ 查询失败: ${error.message}`
+        // 降级：资料/航班接口（api.volanta.app）不可用时，尝试从实时航班数据
+        // （webassets.volanta.app，不同主机）获取该用户的在飞信息，至少给出基本状态。
+        const reason = describeHttpError(error)
+        try {
+          const fallbackFlight = networkUserName
+            ? await fetchFlightByUsername(networkUserName, false)
+            : null
+          if (fallbackFlight) {
+            const { baseInfo } = await buildFlightInfo(fallbackFlight)
+            return `⚠️ Volanta 资料接口暂时不可用（${reason}），以下为实时航班信息：\n\n${baseInfo}`
+          }
+        } catch (fallbackError: any) {
+          log('warn', 'volanta信息降级查询实时航班也失败', { error: fallbackError.message })
+        }
+        return `❌ 查询失败: ${reason}`
       }
     })
 
@@ -2311,8 +2929,12 @@ const queryCmd = ctx.command('volanta查询 [target]', '查询被@用户、呼�
     forceRefresh: config.forceRefresh,
     cacheDuration: config.cacheDuration,
     timeout: config.timeout,
+    dataTimeout: config.dataTimeout,
     selectionTimeout: config.selectionTimeout,
     screenshotDelay: config.screenshotDelay,
-    retryCount: config.retryCount
+    zoomLevel: config.zoomLevel,
+    retryCount: config.retryCount,
+    aiEnabled: config.aiEnabled,
+    aiModel: config.aiEnabled ? config.aiModel : undefined,
   })
 }
