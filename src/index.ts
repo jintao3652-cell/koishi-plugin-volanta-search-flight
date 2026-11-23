@@ -2,6 +2,7 @@ import { Context, Schema, h, segment, Session, Fragment } from 'koishi'
 import { } from 'koishi-plugin-puppeteer'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { createRequire } from 'node:module'
+import { execFile } from 'child_process'
 import { resolve } from 'path'
 
 /**
@@ -98,6 +99,19 @@ function oneBotWithTimeout<T>(promise: Promise<T>, ms: number, label: string): P
 }
 
 const FORWARD_ATTEMPT_TIMEOUT = 10000
+// 合并转发射失败后的整体重试次数（每轮内部仍会依次尝试多种 OneBot action）。
+const FORWARD_SEND_RETRY = 3
+// 合并转发最终失败时给用户看的固定提示。
+const FORWARD_SEND_FAIL_MESSAGE = '信息输出失败，请重新获取'
+
+/** 合并转发重试耗尽后抛出的专用错误，调用方据此原样返回固定提示，不再降级发送。 */
+class ForwardSendError extends Error {
+  constructor(cause?: unknown) {
+    super(FORWARD_SEND_FAIL_MESSAGE)
+    this.name = 'ForwardSendError'
+    if (cause !== undefined) (this as any).cause = cause
+  }
+}
 
 /**
  * 发送合并转发消息。
@@ -198,21 +212,33 @@ async function sendFlightForward(session: Session, routeMessage: string, mainMes
       { type: 'node', data: { user_id: selfId, nickname: 'Volanta', content: toForwardContent(mainMessage) } },
     ]
     if (groupId || userId) {
-      try {
-        await oneBotSendForward(bot, groupId, userId, nodes)
-        return
-      } catch (error: any) {
-        moduleLog('warn', 'OneBot 合并转发失败，回退普通发送', { error: error?.message || String(error) })
+      // 合并转发失败则重试 FORWARD_SEND_RETRY 轮；全部失败直接抛错，不再降级为普通发送。
+      let lastError: any
+      for (let attempt = 1; attempt <= FORWARD_SEND_RETRY; attempt++) {
+        try {
+          await oneBotSendForward(bot, groupId, userId, nodes)
+          moduleLog('info', 'OneBot 合并转发成功', { attempt })
+          return
+        } catch (error: any) {
+          lastError = error
+          moduleLog('warn', 'OneBot 合并转发失败，准备重试', {
+            attempt,
+            maxRetries: FORWARD_SEND_RETRY,
+            error: error?.message || String(error),
+          })
+        }
       }
+      // 重试耗尽：不降级，直接抛专用错误让上层提示用户重新获取。
+      moduleLog('error', 'OneBot 合并转发重试耗尽，放弃发送', {
+        maxRetries: FORWARD_SEND_RETRY,
+        error: lastError?.message || String(lastError),
+      })
+      throw new ForwardSendError(lastError)
     }
-    // OneBot 转发不可用：逐条普通发送（图片可正常附带）
-    await session.send(routeMessage)
-    await session.send(mainMessage)
-    return
   }
 
   // 非 OneBot 平台（Discord 等）：合并转发段在部分适配器下无法附带 base64 截图，
-  // 直接按节点逐条以普通消息发送，确保截图图片能正常附带。
+  // 直接按节点逐条以普通消息发送，确保截图图片能正常附带（这些平台本就没有合并转发能力）。
   await session.send(routeMessage)
   await session.send(mainMessage)
 }
@@ -245,6 +271,13 @@ export interface Config {
   aiModel: string
   aiTimeout: number
   aiPrompt: string
+  // 地图渲染
+  mapMode: string
+  mapProvider: string
+  lowAltitudeThresholdFt: number
+  lowAltZoom: number
+  routePaddingPx: number
+  officialPageForLowAltitude: boolean
 }
 
 export const Config = Schema.object({
@@ -375,6 +408,43 @@ export const Config = Schema.object({
     .role('textarea')
     .default(DEFAULT_AI_PROMPT)
     .description('审核提示词；模型只需回复 BLOCK（拦截）或 PASS（放行）'),
+
+  mapMode: Schema.union([
+    Schema.const('custom').description('自绘地图（推荐，支持按高度切换视野）'),
+    Schema.const('volanta').description('Volanta 官方页面截图（视野靠注入 localStorage 控制；官方页巡航时不画航迹/本机图标）'),
+  ]).default('custom')
+    .description('地图渲染方式。自绘模式按高度自动切换视野：高于阈值显示起落机场+航路全览，低于阈值放大到航空器所在位置。'),
+
+  mapProvider: Schema.union([
+    Schema.const('esri-darkgray').description('Esri 暗色（接近 Volanta 风格）'),
+    Schema.const('esri-satellite').description('Esri 卫星影像'),
+    Schema.const('esri-topo').description('Esri 地形图'),
+    Schema.const('osm').description('OpenStreetMap'),
+  ]).default('esri-darkgray')
+    .description('自绘地图的瓦片源（免 key）。'),
+
+  lowAltitudeThresholdFt: Schema.number()
+    .default(3000)
+    .min(0)
+    .max(20000)
+    .description('高度阈值（英尺，MSL）：高于此值显示起落机场+航路全览，不高于此值用官方页定位放大。'),
+
+  officialPageForLowAltitude: Schema.boolean()
+    .default(true)
+    .description('低空（≤阈值）改用 Volanta 官方页截图：通过注入 localStorage 的 mapCenter/mapZoom 让官方地图开局精确停在航空器上空（已验证）。关闭则低空也用自绘地图。'),
+
+  lowAltZoom: Schema.number()
+    .default(13)
+    .min(8)
+    .max(17)
+    .step(0.5)
+    .description('低空（不高于阈值）时地图放大级别。13 约能看到机场跑道细节。'),
+
+  routePaddingPx: Schema.number()
+    .default(48)
+    .min(0)
+    .max(200)
+    .description('高空全览时航路四周留白（像素）。'),
 })
 
 // 定义Volanta API返回的数据结构
@@ -604,12 +674,13 @@ export function apply(ctx: Context, config: Config) {
    * sharp 为可选增强依赖：不可用或压缩失败时原样返回，不影响主流程。
    */
   async function prepareImageForAi(buffer: Buffer): Promise<{ data: Buffer; mime: string }> {
-    if (buffer.length * 4 / 3 <= AI_MAX_BASE64_LENGTH) return { data: buffer, mime: 'image/png' }
+    const detected = sniffImageMime(buffer)
+    if (buffer.length * 4 / 3 <= AI_MAX_BASE64_LENGTH) return { data: buffer, mime: detected }
     // 可选增强依赖，不可用时按原图走（requireOptional 保证各种加载方式下都能取到 require）
     const sharp = requireOptional('sharp')
     if (!sharp) {
       log('warn', '送审图片过大但 sharp 不可用，按原图调用 AI', { size: buffer.length })
-      return { data: buffer, mime: 'image/png' }
+      return { data: buffer, mime: detected }
     }
     // 逐级降采样直到 base64 落在网关可接受范围内。
     // 只压一次 jpeg 并不总够：地图截图在高 deviceScaleFactor 下噪点极多，
@@ -648,7 +719,7 @@ export function apply(ctx: Context, config: Config) {
       return best
     }
     log('warn', '送审图片压缩失败，按原图调用 AI', { error: detail, size: buffer.length })
-    return { data: buffer, mime: 'image/png' }
+    return { data: buffer, mime: detected }
   }
 
   async function requestAiImageCheck(imageUrl: string, label: string): Promise<boolean | null> {
@@ -1189,47 +1260,68 @@ export function apply(ctx: Context, config: Config) {
     if (!session || nodes.length === 0) return false
 
     const bot = session.bot as any
-    if ((session.platform === 'onebot' || bot?.platform === 'onebot') && bot) {
-      try {
-        const messages = toOneBotForwardNodes(session, nodes)
-        const groupId = session.isDirect ? null : extractOneBotTargetId(session.guildId || session.channelId)
-        const userId = session.isDirect ? extractOneBotTargetId(session.userId || session.channelId) : null
-        if (groupId || userId) {
-          // NapCat 使用统一的 send_forward_msg，LLOneBot 使用 send_group/private_forward_msg，
-          // oneBotSendForward 会依次尝试，两者都可用。
-          await oneBotSendForward(bot, groupId, userId, messages)
-          return true
+    const isOneBot = session.platform === 'onebot' || bot?.platform === 'onebot'
+
+    if (isOneBot) {
+      const messages = toOneBotForwardNodes(session, nodes)
+      const groupId = session.isDirect ? null : extractOneBotTargetId(session.guildId || session.channelId)
+      const userId = session.isDirect ? extractOneBotTargetId(session.userId || session.channelId) : null
+      if (groupId || userId) {
+        // 合并转发失败则重试 FORWARD_SEND_RETRY 轮；全部失败直接抛错，不再降级为普通发送。
+        let lastError: any
+        for (let attempt = 1; attempt <= FORWARD_SEND_RETRY; attempt++) {
+          try {
+            // NapCat 使用统一的 send_forward_msg，LLOneBot 使用 send_group/private_forward_msg，
+            // oneBotSendForward 会依次尝试，两者都可用。
+            await oneBotSendForward(bot, groupId, userId, messages)
+            log('info', 'OneBot 合并转发成功', { attempt, nodeCount: nodes.length })
+            return true
+          } catch (error: any) {
+            lastError = error
+            log('warn', 'OneBot 合并转发失败，准备重试', {
+              attempt,
+              maxRetries: FORWARD_SEND_RETRY,
+              error: error?.message || String(error),
+            })
+          }
         }
-      } catch (error: any) {
-        log('warn', 'OneBot合并转发失败，回退普通发送', {
-          error: error?.message || String(error),
+        // 重试耗尽：不降级，直接抛专用错误让上层提示用户重新获取。
+        log('error', 'OneBot 合并转发重试耗尽，放弃发送', {
+          maxRetries: FORWARD_SEND_RETRY,
+          nodeCount: nodes.length,
+          error: lastError?.message || String(lastError),
         })
+        throw new ForwardSendError(lastError)
       }
     }
 
-    if (session.platform === 'onebot' || (session.bot as any)?.platform === 'onebot') {
-      // A direct OneBot forward attempt above has already failed. The generic
-      // encoder uses the same API, so fall back to regular messages instead.
-      for (const node of nodes) {
-        await session.send(node.message)
-      }
-      return true
-    }
-
-    try {
-      const forwardMessage = segment('message', { forward: true }, nodes.map((node) => segment('message', {}, node.message)))
-      await session.send(forwardMessage)
-      return true
-    } catch (error: any) {
-      log('warn', '通用合并转发失败，回退普通发送', {
-        error: error?.message || String(error),
-      })
-    }
-
+    // 非 OneBot 平台（Discord 等）没有 QQ 式合并转发能力，按节点逐条发送
+    // （与 sendFlightForward 保持一致，这是平台能力差异，不是转发失败后的降级）。
     for (const node of nodes) {
       await session.send(node.message)
     }
     return true
+  }
+
+  /**
+   * 用 curl 子进程请求 JSON（仅用于 xflysim 机场接口）。
+   * 原因：该接口经 Cloudflare，按 TLS/JA3 指纹拦截机器人。Node 的 undici(fetch)、
+   * axios(https 模块) 请求一律返回 403 挑战页（statusText 为空 → error.message 为空），
+   * 即使带浏览器 UA 也一样；只有 curl 的指纹能稳定拿到 200（实测 2026-11-20）。
+   */
+  function curlJson<T = any>(url: string, timeoutMs: number, userAgent: string): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const secs = Math.max(1, Math.ceil(timeoutMs / 1000))
+      const args = ['-sS', '--max-time', String(secs), '-A', userAgent, '-H', 'Accept: application/json', url]
+      execFile('curl', args, { maxBuffer: 4 * 1024 * 1024, timeout: timeoutMs + 1000 }, (err, stdout, stderr) => {
+        if (err) return reject(new Error(String(stderr || err.message || err).trim()))
+        try {
+          resolve(JSON.parse(stdout) as T)
+        } catch {
+          reject(new Error('机场接口返回非 JSON：' + String(stdout).slice(0, 120)))
+        }
+      })
+    })
   }
 
   // 获取机场中文名称
@@ -1281,19 +1373,18 @@ export function apply(ctx: Context, config: Config) {
           log('info', '机场信息接口疑似抖动，重试一次', { icao, attempt })
           await new Promise(res => setTimeout(res, 500))
         }
+        // 机场信息统一走 EFb 接口：GET /api/efb/airports/{gpsCode}
+        // 返回结构与旧的 realTimeMap 接口一致（code=20000 + data.cnName/iataCode/...），解析逻辑不变。
+        const airportUrl = `https://api.xflysim.com/pilot/api/efb/airports/${encodeURIComponent(icao.trim().toUpperCase())}`
         log('debug', '开始请求xflysim机场API', {
           icao,
           attempt,
-          url: `https://api.xflysim.com/pilot/api/realTimeMap/airports/${icao}`
+          url: airportUrl
         })
 
-        const response = await ctx.http.get(`https://api.xflysim.com/pilot/api/realTimeMap/airports/${icao}`, {
-          // 机场中文名是附加信息，使用独立的短超时，避免接口异常时拖慢整个查询
-          timeout: config.airportApiTimeout,
-          headers: {
-            'User-Agent': config.userAgent
-          }
-        }) as XflysimAirportResponse
+        // 机场接口经 Cloudflare 按 TLS 指纹拦 Node 的 fetch/axios（403 空 statusText），
+        // 必须走 curl 子进程（其指纹可通过），详见 curlJson 注释。
+        const response = await curlJson<XflysimAirportResponse>(airportUrl, config.airportApiTimeout, config.userAgent)
 
         log('debug', '收到xflysim API响应', {
           icao,
@@ -1481,8 +1572,12 @@ export function apply(ctx: Context, config: Config) {
 
   /** 真正发起上游请求的部分（含重试与兜底），由 fetchAllFlights 负责并发去重。 */
   async function fetchAllFlightsFromApi(): Promise<VolantaFlight[]> {
-    // 该 JSON 约 3MB，上游 Cloudflare（cf-cache-status: DYNAMIC）不缓存、每次回源，
-    // 网络抖动时单次下载可能 30~60 秒，因此单独使用 dataTimeout。
+    // 数据源：slim 快照是官方「当前在飞」精简列表，实时更新（实测几分钟内），约 1.5MB；
+    // 旧的 volanta-flight-positions.json 实测会整天停更（2026-11-20 全天卡在 11-19 10:31），
+    // 导致刚起飞的航班（如 HKE541）完全搜不到。故改用 slim 作为主源。
+    // slim 字段比完整版少（无 privacyOption / atcRoute 偶缺），解析后统一规范化。
+    // 上游 Cloudflare（cf-cache-status: DYNAMIC）不缓存、每次回源，网络抖动时单次下载
+    // 可能 30~60 秒，因此单独使用 dataTimeout。
     const dataTimeout = Math.max(config.dataTimeout || 0, config.timeout || 0, 60000)
 
     for (let attempt = 1; attempt <= config.retryCount + 1; attempt++) {
@@ -1492,7 +1587,7 @@ export function apply(ctx: Context, config: Config) {
         const requestStartTime = Date.now()
         log('debug', '发送HTTP请求到Volanta API')
         
-        const response = await ctx.http.get('https://webassets.volanta.app/volanta-flight-positions.json', {
+        const response = await ctx.http.get('https://webassets.volanta.app/volanta-flight-positions-slim.json', {
           timeout: dataTimeout,
           headers: {
             'User-Agent': config.userAgent
@@ -1533,6 +1628,16 @@ export function apply(ctx: Context, config: Config) {
         } else {
           log('warn', 'API返回未知格式数据', { responseType: typeof response })
         }
+
+        // slim 快照字段比旧完整版少：privacyOption 全缺、connections/atcRoute 偶缺。
+        // 该快照本身是官方「当前在飞」公开列表，缺失隐私字段按 Public 处理，
+        // 否则后续 privacyOption !== 'Public' 的校验会把所有航班误判为「非公开」。
+        flights = flights.map(f => ({
+          ...f,
+          privacyOption: (f as any).privacyOption || 'Public',
+          connections: (f as any).connections || {} as any,
+          atcRoute: (f as any).atcRoute || '',
+        })) as VolantaFlight[]
 
         log('info', '成功获取航班数据', { 
           flightCount: flights.length,
@@ -1705,6 +1810,25 @@ export function apply(ctx: Context, config: Config) {
     return null
   }
 
+  // 与 fetchFlightByQuery 同样的匹配优先级，但返回全部命中项，供多条时让用户自选。
+  async function fetchAllFlightsByQuery(query: string, forceRefresh: boolean = false): Promise<VolantaFlight[]> {
+    const normalized = query.trim().toUpperCase()
+    if (!normalized) return []
+    const flights = await fetchAllFlights(forceRefresh)
+    const fieldOf = (flight: VolantaFlight, field: 'callsign' | 'networkUserName' | 'flightNumber') =>
+      String(flight[field] ?? '').trim().toUpperCase()
+    for (const field of ['callsign', 'networkUserName', 'flightNumber'] as const) {
+      const matches = flights.filter(item => fieldOf(item, field) === normalized)
+      if (matches.length) {
+        log('info', '通用关键词多条精确匹配', { query, field, matchCount: matches.length })
+        return matches
+      }
+    }
+    const partial = flights.filter(item => fieldOf(item, 'networkUserName').includes(normalized))
+    if (partial.length) log('info', '通用关键词多条用户名包含匹配', { query, matchCount: partial.length })
+    return partial
+  }
+
   // 通过networkUserId获取航班数据 - 强制刷新版本
   async function fetchFlightByNetworkUserId(networkUserId: string, forceRefresh: boolean = false): Promise<VolantaFlight | null> {
     log('debug', '开始通过networkUserId搜索航班', { networkUserId, forceRefresh })
@@ -1734,6 +1858,576 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
+  // ===================== 自绘地图渲染（按高度切换视野） =====================
+
+  // Volanta 航班详情（含机场坐标与历史轨迹）
+  interface FlightDetailPosition {
+    latitude: number
+    longitude: number
+    altitude: number
+    altitudeAgl: number
+    headingTrue: number
+    groundSpeed: number
+    onGround: boolean
+    time: string
+  }
+  interface FlightDetailAirport {
+    icaoCode?: string
+    iataCode?: string
+    name?: string
+    latitude?: number
+    longitude?: number
+  }
+  interface FlightDetail {
+    callsign?: string
+    flightNumber?: string
+    aircraftTitle?: string
+    origin?: FlightDetailAirport | null
+    destination?: FlightDetailAirport | null
+    position?: FlightDetailPosition | null
+    positions?: FlightDetailPosition[]
+  }
+
+  const MAP_PROVIDERS: Record<string, { url: string; attribution: string; dark: boolean }> = {
+    'esri-darkgray': {
+      url: 'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}',
+      attribution: 'Esri, HERE, Garmin',
+      dark: true,
+    },
+    'esri-satellite': {
+      url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+      attribution: 'Esri, Maxar, Earthstar Geographics',
+      dark: true,
+    },
+    'esri-topo': {
+      url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}',
+      attribution: 'Esri',
+      dark: false,
+    },
+    'osm': {
+      url: 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+      attribution: '&copy; OpenStreetMap contributors',
+      dark: false,
+    },
+  }
+
+  function escapeHtmlAttr(s: string): string {
+    return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string))
+  }
+
+  /**
+   * 按文件头判断图片真实格式。截图可能输出 jpeg（自绘地图默认）或 png，
+   * base64 data URL 的 mime 必须和实际内容一致，否则部分网关会拒收。
+   */
+  function sniffImageMime(bytes: Buffer): string {
+    if (bytes.length > 8 && bytes[0] === 0x89 && bytes[1] === 0x50) return 'image/png'
+    if (bytes.length > 3 && bytes[0] === 0xff && bytes[1] === 0xd8) return 'image/jpeg'
+    if (bytes.length > 6 && bytes.toString('ascii', 0, 3) === 'GIF') return 'image/gif'
+    if (bytes.length > 12 && bytes.toString('ascii', 8, 12) === 'WEBP') return 'image/webp'
+    return 'image/png'
+  }
+
+  /**
+   * 检测截图是否为「纯色空图」：页面 JS/地图未渲染时整页是一片深色，
+   * 但 3840x2160 的纯色 JPEG 压缩后仍有 ~49KB，单纯按字节数判断会漏过（实测 2026-11-20
+   * 一张 R25/G27/B26 全通道 stdev=0 的纯黑图被当成成功发出）。
+   * 用 sharp.stats() 看各通道标准差：正常地图/页面 stdev 远大于阈值，纯色图接近 0。
+   * sharp 不可用或分析出错时保守返回 false（不误杀正常截图）。
+   */
+  async function isBlankScreenshot(buffer: Buffer | null | undefined): Promise<boolean> {
+    if (!buffer || buffer.length < 2000) return true
+    const sharp = requireOptional('sharp')
+    if (!sharp) return false
+    try {
+      const stats = await sharp(buffer).stats()
+      const stdevs = (stats.channels || []).slice(0, 3).map((c: any) => Number(c.stdev) || 0)
+      if (!stdevs.length) return false
+      const maxStdev = Math.max(...stdevs)
+      const blank = maxStdev < 2.5
+      if (blank) log('warn', '截图为纯色空图（stdev 过低）', { size: buffer.length, stdevs })
+      return blank
+    } catch (error: any) {
+      log('warn', '截图空白检测失败，按正常截图处理', { error: error?.message || String(error) })
+      return false
+    }
+  }
+
+  /**
+   * 拉取航班详情（一个请求拿齐：起降机场坐标 + 历史轨迹 + 当前位置）。
+   * includePositions=true 时 positions 为已飞轨迹点数组，但**顺序是「最新→最旧」倒序**，
+   * 使用前必须经 sortTrackAscending() 转成时间升序。
+   */
+  async function fetchFlightDetail(flightId: string): Promise<FlightDetail | null> {
+    try {
+      const data = await ctx.http.get<FlightDetail>(`https://api.volanta.app/api/v1/Flights/${flightId}?includePositions=true`, {
+        timeout: Math.min(config.timeout, 30000),
+        headers: { 'User-Agent': config.userAgent },
+      })
+      return data || null
+    } catch (error: any) {
+      log('warn', '获取航班详情（自绘地图数据）失败', { error: error?.message || String(error), flightId })
+      return null
+    }
+  }
+
+  /**
+   * Volanta 的 positions 是「最新 → 最旧」倒序返回的。
+   * 实测（2026-10-21，巡航 FL330 的航班）：positions[0] 时间为当前时刻、高度 33020ft，
+   * 而 positions[末尾] 是撤轮挡前的地面点，高度 ≈ 机场标高（1270~1300ft）。
+   * 旧代码按「最早→最新」的假设取 track[末尾] 当当前位置，取到的其实是起飞前地面点，
+   * 于是巡航在 FL320/FL330 的航班被判成「低空」并放大到起飞机场。
+   * 这里统一按 time 升序整理（缺失/非法时间的点排在最前），保证 track 尾点 = 最新位置。
+   */
+  function sortTrackAscending(track: FlightDetailPosition[]): FlightDetailPosition[] {
+    const ts = (p: FlightDetailPosition) => {
+      const t = p.time ? Date.parse(p.time) : NaN
+      return Number.isFinite(t) ? t : 0
+    }
+    if (!track.some(p => ts(p) > 0)) return track
+    return track.slice().sort((a, b) => ts(a) - ts(b))
+  }
+
+  /** 取「当前」位置：轨迹里时间最新的一点，与实时 position 比较后取更新的那个。 */
+  function pickCurrentPosition(
+    track: FlightDetailPosition[],
+    fallback?: FlightDetailPosition | null,
+  ): FlightDetailPosition | undefined {
+    const newest = track.length ? track[track.length - 1] : undefined
+    const fb = fallback && typeof (fallback as any).latitude === 'number' ? fallback : undefined
+    if (!newest) return fb
+    if (!fb) return newest
+    const tn = newest.time ? Date.parse(newest.time) : NaN
+    const tf = fb.time ? Date.parse(fb.time) : NaN
+    if (Number.isFinite(tn) && Number.isFinite(tf)) return tf > tn ? fb : newest
+    return newest
+  }
+
+  /** 读轨迹 + 当前位置（轨迹按 time 升序），供视野决策与绘制共用。 */
+  function readTrackAndCurrent(detail: FlightDetail | null, flight: VolantaFlight) {
+    const track = detail && Array.isArray(detail.positions) ? sortTrackAscending(detail.positions) : []
+    const fallback = (flight.position || (detail as any)?.position || null) as FlightDetailPosition | null
+    const cur = pickCurrentPosition(track, fallback)
+    return { track, cur }
+  }
+
+  /**
+   * 低空判定：不高于阈值，或已接地（onGround）算低空。
+   * 接地判断是必要补充：高海拔机场（如墨西哥城 7300ft）落地后 MSL 高度仍高于 3000ft
+   * 阈值，只按高度判会误判成「航路全览」。
+   */
+  function isLowAltitude(p: FlightDetailPosition | undefined | null): boolean {
+    if (!p) return false
+    if (p.onGround === true) return true
+    const alt = typeof p.altitude === 'number' && Number.isFinite(p.altitude)
+      ? p.altitude
+      : (typeof p.altitudeAgl === 'number' && Number.isFinite(p.altitudeAgl) ? p.altitudeAgl : Infinity)
+    return alt <= config.lowAltitudeThresholdFt
+  }
+
+  /**
+   * 计算官方页要注入的视野（mapCenter / mapZoom）。
+   *
+   * 背景（2026-10-21 实测）：官方 stats 页的 Mapbox 地图**不会**自动定位到所查询的航班。
+   * 它的初始视野完全来自 localStorage 的 mapCenter/mapZoom；两个键都不存在时退回
+   * 「z4 + 欧洲」的默认视野，而浏览器实例长期存活，之前低空截图注入过的坐标会残留在
+   * 同一 profile 里 —— 于是出现「查询 ZGKL→ZSWX，截图却停在上一班飞机所在的 EGLL」。
+   * 结论：官方页路径必须**每班都主动注入**视野，不能依赖页面默认状态：
+   * - 巡航：按「起降机场 + 已飞航迹」bbox 拟合，并把视野中心右移让开左侧信息面板；
+   * - 低空/接地：定位到航空器位置并放大到 lowAltZoom。
+   */
+  function computeOfficialView(
+    detail: FlightDetail | null,
+    cur: FlightDetailPosition | undefined,
+  ): { lat: number, lon: number, zoom: number, mode: 'route' | 'aircraft' } | null {
+    const TILE = 512
+    const width = Math.max(320, config.viewportWidth)
+    const height = Math.max(320, config.viewportHeight)
+    // 官方页左侧是固定信息面板（约 31% 宽），真正能看到地图的只有右侧
+    const usableW = width * 0.66
+    const usableH = height * 0.78
+
+    if (isLowAltitude(cur) && cur) {
+      const pos = extrapolatePosition(cur)
+      const zoom = Math.max(3, Math.min(17, config.lowAltZoom || 13))
+      return { lat: pos.latitude, lon: pos.longitude, zoom, mode: 'aircraft' }
+    }
+
+    const pts: [number, number][] = []
+    const push = (lat?: number | null, lon?: number | null) => {
+      if (typeof lat === 'number' && typeof lon === 'number' && Number.isFinite(lat) && Number.isFinite(lon)) {
+        pts.push([lat, lon])
+      }
+    }
+    push(detail?.origin?.latitude, detail?.origin?.longitude)
+    push(detail?.destination?.latitude, detail?.destination?.longitude)
+    if (cur) push(cur.latitude, cur.longitude)
+    const track = detail && Array.isArray(detail.positions) ? sortTrackAscending(detail.positions) : []
+    const step = Math.max(1, Math.floor(track.length / 24))
+    for (let i = 0; i < track.length; i += step) push(track[i].latitude, track[i].longitude)
+
+    if (!pts.length) return null
+    if (pts.length === 1) return { lat: pts[0][0], lon: pts[0][1], zoom: 6, mode: 'route' }
+
+    const merc = (latDeg: number) => Math.log(Math.tan(Math.PI / 4 + (latDeg * Math.PI) / 360))
+    const lats = pts.map(p => p[0])
+    const lons = pts.map(p => p[1])
+    const minLat = Math.min(...lats), maxLat = Math.max(...lats)
+    const minLon = Math.min(...lons), maxLon = Math.max(...lons)
+    const lonSpan = Math.max(0.02, maxLon - minLon)
+    const mercSpan = Math.max(0.0002, merc(maxLat) - merc(minLat))
+
+    // Web Mercator 下：横向跨度对应 lonSpan/360 个世界宽度，纵向跨度对应 mercSpan/2π 个世界高度
+    const zLon = Math.log2(usableW / ((TILE * lonSpan) / 360))
+    const zLat = Math.log2(usableH / ((TILE * mercSpan) / (2 * Math.PI)))
+    // 取整到 0.25 级，并限制在 2~11（航路全览不该比 11 更放大）
+    const zoom = Math.max(2, Math.min(11, Math.floor(Math.min(zLon, zLat) * 4) / 4))
+
+    const scale = TILE * Math.pow(2, zoom)
+    const centerMerc = (merc(minLat) + merc(maxLat)) / 2
+    const centerLat = (2 * Math.atan(Math.exp(centerMerc)) - Math.PI / 2) * 180 / Math.PI
+    // 可见区中心在 0.655W，比画布中心偏右 0.155W，因此视野中心要往西挪相应经度
+    const rawLon = (minLon + maxLon) / 2 - (0.155 * width * 360) / scale
+    const centerLon = (((rawLon + 540) % 360) + 360) % 360 - 180
+    return { lat: centerLat, lon: centerLon, zoom, mode: 'route' }
+  }
+
+  /**
+   * 自绘地图截图（Leaflet + 免 key 瓦片），精确控制视野：
+   * - 高于 lowAltitudeThresholdFt：fitBounds 到「起飞机场 + 全部已飞航迹 + 降落机场」，
+   *   即把起落机场与航路作为显示范围；
+   * - 不高于阈值：setView 到航空器当前位置（仅在官方页定位截图失败时作为回退，
+   *   正常情况下低空走 captureOfficialMapScreenshot 的官方页注入定位）。
+   * 数据来自 Volanta 官方 API。
+   */
+  async function captureCustomMapScreenshot(flight: VolantaFlight, preDetail?: FlightDetail): Promise<Buffer | null> {
+    const detail = preDetail || await fetchFlightDetail(flight.id)
+    if (!detail) return null
+
+    const origin = detail.origin
+    const dest = detail.destination
+    // 轨迹必须按时间升序（API 返回的是倒序），当前位置取轨迹里最新一点
+    const { track, cur } = readTrackAndCurrent(detail, flight)
+    if (!cur || typeof cur.latitude !== 'number') {
+      log('warn', '自绘地图缺当前位置，放弃渲染', { flightId: flight.id })
+      return null
+    }
+
+    const provider = MAP_PROVIDERS[config.mapProvider] || MAP_PROVIDERS['esri-darkgray']
+    const dark = provider.dark
+    const accent = '#4cc3ff'          // 航迹青蓝
+    const doneColor = accent
+    const todoColor = '#9aa4b2'       // 未飞航段灰
+    const originColor = '#39d98a'     // 起飞机场绿
+    const destColor = '#ff5c8a'       // 降落机场品红
+    const fg = dark ? '#e8edf2' : '#1d2430'
+    const subText = dark ? '#9aa4b2' : '#5a6675'
+    const panelBg = dark ? 'rgba(13, 18, 26, 0.86)' : 'rgba(255, 255, 255, 0.9)'
+
+    const originIcao = origin?.icaoCode || flight.originIcao || 'ORIGIN'
+    const destIcao = dest?.icaoCode || flight.destinationIcao || 'DEST'
+    const callsign = detail.callsign || flight.callsign || flight.flightNumber || ''
+    const heading = Math.round(cur.headingTrue || 0)
+    const altFt = Math.round(cur.altitude ?? cur.altitudeAgl ?? 0)
+    const gsKt = Math.round(cur.groundSpeed || 0)
+    const lowMode = isLowAltitude(cur)
+
+    // 已飞轨迹（有效点过滤）
+    const trackLL: [number, number][] = track
+      .filter(p => typeof p.latitude === 'number' && typeof p.longitude === 'number')
+      .map(p => [p.latitude, p.longitude] as [number, number])
+    // 剩余航段：当前位置 → 目的地
+    const todoLL: [number, number][] = (dest && typeof dest.latitude === 'number')
+      ? [[cur.latitude, cur.longitude], [dest.latitude, dest.longitude] as [number, number]]
+      : []
+
+    // ---- 视野决策（本需求核心） ----
+    let viewJs: string
+    if (!lowMode) {
+      // 全览：起降机场 + 全部航迹
+      const pts: [number, number][] = [...trackLL, ...todoLL]
+      if (origin && typeof origin.latitude === 'number') pts.push([origin.latitude, origin.longitude])
+      if (dest && typeof dest.latitude === 'number') pts.push([dest.latitude, dest.longitude])
+      if (pts.length === 1) {
+        viewJs = `map.setView([${pts[0][0]}, ${pts[0][1]}], ${Math.max(config.lowAltZoom, 8)})`
+      } else {
+        const lats = pts.map(p => p[0]); const lons = pts.map(p => p[1])
+        const sw = [Math.min(...lats), Math.min(...lons)]
+        const ne = [Math.max(...lats), Math.max(...lons)]
+        viewJs = `map.fitBounds([${JSON.stringify(sw)}, ${JSON.stringify(ne)}], { padding: [${config.routePaddingPx}, ${config.routePaddingPx}] })`
+      }
+    } else {
+      // 低空：放大到航空器所在位置
+      viewJs = `map.setView([${cur.latitude}, ${cur.longitude}], ${config.lowAltZoom})`
+    }
+
+    const trackJson = JSON.stringify(trackLL)
+    const todoJson = JSON.stringify(todoLL)
+
+    const html = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  html, body { margin: 0; padding: 0; background: ${dark ? '#14181f' : '#f2f4f7'}; }
+  #map { width: 100vw; height: 100vh; }
+  .info-panel {
+    position: absolute; left: 12px; bottom: 30px; z-index: 1000;
+    background: ${panelBg}; color: ${fg};
+    padding: 10px 14px; border-radius: 10px; font-family: 'Segoe UI', 'PingFang SC', sans-serif;
+    font-size: 14px; line-height: 1.55; max-width: 46vw;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.35); pointer-events: none;
+  }
+  .info-panel .cs { font-size: 17px; font-weight: 700; }
+  .info-panel .sub { color: ${subText}; font-size: 12.5px; }
+  .apt-label { font-family: 'Segoe UI', sans-serif; font-size: 12.5px; font-weight: 700; color: ${fg};
+    text-shadow: ${dark ? '0 0 4px #000, 0 0 4px #000' : '0 0 4px #fff, 0 0 4px #fff'}; white-space: nowrap; }
+  .cs-label { font-family: 'Segoe UI', sans-serif; font-size: 13px; font-weight: 700; color: ${fg};
+    text-shadow: ${dark ? '0 0 4px #000, 0 0 4px #000' : '0 0 4px #fff, 0 0 4px #fff'}; white-space: nowrap; }
+  .leaflet-control-attribution { background: ${dark ? 'rgba(20,24,31,0.7)' : 'rgba(255,255,255,0.8)'} !important; color: ${subText} !important; font-size: 10px; }
+  .leaflet-control-attribution a { color: ${subText} !important; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div class="info-panel">
+  <div class="cs">${escapeHtmlAttr(callsign)} <span class="sub">${lowMode ? '低空 · 定位模式' : '航路全览'}</span></div>
+  <div>ALT ${altFt} ft &nbsp;|&nbsp; GS ${gsKt} kt &nbsp;|&nbsp; HDG ${heading}°</div>
+  <div class="sub">${escapeHtmlAttr(originIcao)} → ${escapeHtmlAttr(destIcao)}${origin?.name ? ' · ' + escapeHtmlAttr(origin.name) : ''}</div>
+</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+  window.__mapReady = false
+  var track = ${trackJson}
+  var todo = ${todoJson}
+  var map = L.map('map', { zoomControl: false, attributionControl: true, preferCanvas: true, zoomSnap: 0.25 })
+  var tiles = L.tileLayer('${provider.url}', { attribution: '${provider.attribution}', maxZoom: 19 })
+  tiles.addTo(map)
+  map.attributionControl.setPrefix('')
+
+  // 已飞航迹
+  if (track.length > 1) L.polyline(track, { color: '${doneColor}', weight: 3, opacity: 0.95, interactive: false }).addTo(map)
+  // 剩余航段（当前位置 → 目的地）
+  if (todo.length === 2) L.polyline(todo, { color: '${todoColor}', weight: 2.5, opacity: 0.85, dashArray: '8 8', interactive: false }).addTo(map)
+
+  function airportMarker(ll, color, label) {
+    L.circleMarker(ll, { radius: 6, color: '#ffffff', weight: 2, fillColor: color, fillOpacity: 1, interactive: false }).addTo(map)
+    L.tooltip({ permanent: true, direction: 'right', offset: [8, 0], className: 'apt-label', interactive: false, opacity: 1 })
+      .setLatLng(ll).setContent(label).addTo(map)
+  }
+  ${origin && typeof origin.latitude === 'number' ? `airportMarker([${origin.latitude}, ${origin.longitude}], '${originColor}', '${escapeHtmlAttr(originIcao)}')` : ''}
+  ${dest && typeof dest.latitude === 'number' ? `airportMarker([${dest.latitude}, ${dest.longitude}], '${destColor}', '${escapeHtmlAttr(destIcao)}')` : ''}
+
+  // 飞机图标（按航向旋转）
+  var planeSvg = '<svg xmlns="http://www.w3.org/2000/svg" width="34" height="34" viewBox="0 0 24 24">' +
+    '<circle cx="12" cy="12" r="11.4" fill="${accent}" fill-opacity="0.2"/>' +
+    '<path d="M12 2 L13.6 9.2 L21.5 13.6 L21.5 15.4 L13.6 12.9 L13.1 18.6 L15.6 20.6 L15.6 22 L12 20.8 L8.4 22 L8.4 20.6 L10.9 18.6 L10.4 12.9 L2.5 15.4 L2.5 13.6 L10.4 9.2 Z" fill="${accent}" stroke="${dark ? '#0b141c' : '#ffffff'}" stroke-width="0.8"/>' +
+    '</svg>'
+  var icon = L.divIcon({
+    className: 'plane-icon',
+    html: '<div style="transform: rotate(${heading}deg); width:34px; height:34px;">' + planeSvg + '</div>',
+    iconSize: [34, 34], iconAnchor: [17, 17],
+  })
+  L.marker([${cur.latitude}, ${cur.longitude}], { icon: icon, interactive: false, zIndexOffset: 1000 }).addTo(map)
+  L.tooltip({ permanent: true, direction: 'right', offset: [20, 0], className: 'cs-label', interactive: false, opacity: 1 })
+    .setLatLng([${cur.latitude}, ${cur.longitude}]).setContent('${escapeHtmlAttr(callsign)}').addTo(map)
+
+  // ---- 视野（按高度自动选择） ----
+  ${viewJs}
+
+  var pending = 0
+  tiles.on('tileloadstart', function () { pending++ })
+  tiles.on('tileload', function () { pending--; if (pending <= 0) window.__mapReady = true })
+  tiles.on('tileerror', function () { pending-- })
+  setTimeout(function () { window.__mapReady = true }, 8000)
+</script>
+</body>
+</html>`
+
+    const page = await ctx.puppeteer.page()
+    try {
+      await page.setViewport({
+        width: Math.max(320, config.viewportWidth),
+        height: Math.max(320, config.viewportHeight),
+        deviceScaleFactor: Math.max(1, config.zoomLevel || 1),
+      })
+      // 项目范式：setContent + load（不要 networkidle2，会卡死超时）
+      await page.setContent(html, { waitUntil: 'load', timeout: config.timeout })
+      await page.waitForFunction(() => (window as any).__mapReady === true, { timeout: config.timeout })
+        .catch(() => { /* 瓦片兜底已保证 ready，超时也照常截图 */ })
+      // 等 fitBounds/setView 动画结束
+      await new Promise(res => setTimeout(res, 800))
+      // 底图是照片式瓦片，PNG 无损存储纯属浪费：实测 1280x720@2x 的 PNG 达 2MB、
+      // base64 后 2.8MB 已逼近 AI 送审 4MB 阈值。默认直接输出 JPEG（q80），
+      // 体积可降到约 1/7，AI 请求更小、响应更快。
+      const useJpeg = config.enableImageOptimization !== false
+      const quality = Math.min(100, Math.max(50, config.imageQuality || 80))
+      const buf = await page.screenshot(useJpeg
+        ? { type: 'jpeg', quality }
+        : { type: 'png' }) as Buffer
+      if (!buf || buf.length < 8000) {
+        log('warn', '自绘地图截图疑似空白', { size: buf?.length, flightId: flight.id })
+        return null
+      }
+      log('info', '自绘地图截图完成', {
+        size: buf.length, lowMode, callsign,
+        format: useJpeg ? `jpeg q${quality}` : 'png',
+      })
+      return buf
+    } finally {
+      await page.close().catch(() => {})
+    }
+  }
+
+  /**
+   * 航位推算：把一份可能滞后的位置报告沿「航向 × 地速 × 数据年龄」外推到当前时刻。
+   * 官方 API 的 positions 首点（最新点）可能滞后几十秒甚至数分钟，而低空放大视野只有约 20km 宽，
+   * 不补偿会把飞机丢出画面。距离单位海里、地速单位节（knots）。
+   */
+  function extrapolatePosition(p: FlightDetailPosition): { latitude: number, longitude: number } {
+    const lat = p.latitude, lon = p.longitude
+    if (typeof lat !== 'number' || typeof lon !== 'number') return { latitude: lat, longitude: lon }
+    const ageSec = p.time ? (Date.now() - Date.parse(p.time)) / 1000 : 0
+    const gsKt = p.groundSpeed || 0
+    const hdg = p.headingTrue
+    if (!ageSec || ageSec < 5 || ageSec > 600 || !gsKt || gsKt < 30 || typeof hdg !== 'number') {
+      return { latitude: lat, longitude: lon }
+    }
+    const distNm = Math.min(gsKt * ageSec / 3600, 40) // 最多外推 40nm，防止异常数据放飞
+    const R = 3440.065 // 地球半径（海里）
+    const br = hdg * Math.PI / 180
+    const lat1 = lat * Math.PI / 180
+    const lon1 = lon * Math.PI / 180
+    const sinD = Math.sin(distNm / R)
+    const cosD = Math.cos(distNm / R)
+    const lat2 = Math.asin(Math.sin(lat1) * cosD + Math.cos(lat1) * sinD * Math.cos(br))
+    const lon2 = lon1 + Math.atan2(Math.sin(br) * sinD * Math.cos(lat1), cosD - Math.sin(lat1) * Math.sin(lat2))
+    return {
+      latitude: lat2 * 180 / Math.PI,
+      longitude: ((lon2 * 180 / Math.PI) + 540) % 360 - 180,
+    }
+  }
+
+  /** 官方页 header 里「跟随航班」按钮（用户 2026-10-21 指路，XPath 兜底用） */
+  const FOLLOW_XPATH = '/html/body/app-root/div/app-flight-view/div/div/app-flight-card-header/div/ul[3]/li[2]/a/img'
+  const FOLLOW_SELECTOR = 'app-flight-card-header a img[src*="follow.svg"]'
+
+  /** 读取「跟随航班」按钮位置与激活状态；找不到返回 null。 */
+  async function readFollowButton(page: any): Promise<{ x: number, y: number, w: number, h: number, active: boolean } | null> {
+    return await page.evaluate((sel: string, xp: string) => {
+      let el: any = document.querySelector(sel)
+      if (!el) {
+        const r = document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null)
+        el = r.singleNodeValue
+      }
+      if (!el) return null
+      const a = el.closest('a')
+      const box = el.getBoundingClientRect()
+      return {
+        x: box.x, y: box.y, w: box.width, h: box.height,
+        active: !!(a && String(a.className || '').includes('is-active')),
+      }
+    }, FOLLOW_SELECTOR, FOLLOW_XPATH).catch(() => null)
+  }
+
+  /**
+   * 官方页截图：`/stats` 路由 + 点击「跟随航班」。
+   *
+   * 实测结论（2026-10-21，用户指路后验证）：
+   * - `/flights/{id}/stats`（与 `/details` 相同）都会画出该航班的已飞航迹（品红色线）
+   *   和本机蓝色图标；两者只差左侧面板内容（统计 vs 飞行计划）。最终采用 `/stats`。
+   * - header 里 `/ul[3]/li[2]/a/img`（`follow.svg`）就是「跟随航班」按钮 —— **真实鼠标点击**后
+   *   地图立刻居中到航空器、按钮置为 `is-active`。此前把这颗按钮误判成「关注/取关」而删掉点击，
+   *   是错的（这也是当时「点追踪按钮会出问题」这个怀疑的来源，其实它正是我们要的控件）；
+   * - 跟随**不改变缩放级别**，视野的初始级别仍由 localStorage 的 `mapCenter/mapZoom` 决定。
+   *   因此先注入「航空器位置 + 目标 zoom」，再点跟随做精确对齐：即使跟随按钮没命中，
+   *   注入的视野也已经停在正确位置（不会再出现继承上一班坐标、画到 EGLL 的情况）；
+   * - 巡航用按航路 bbox 拟合的级别（限制 6~9，长航线不会压成 z3），低空/接地用 lowAltZoom。
+   */
+  async function captureOfficialMapScreenshot(flight: VolantaFlight, preDetail?: FlightDetail): Promise<Buffer | null> {
+    const detail = preDetail || await fetchFlightDetail(flight.id)
+    if (!detail) return null
+    const { cur } = readTrackAndCurrent(detail, flight)
+    if (!cur || typeof cur.latitude !== 'number') {
+      log('warn', '官方页定位缺当前位置', { flightId: flight.id })
+      return null
+    }
+    const pos = extrapolatePosition(cur)
+    const lowMode = isLowAltitude(cur)
+    const routeView = computeOfficialView(detail, cur)
+    const zoom = lowMode
+      ? Math.max(3, Math.min(17, config.lowAltZoom || 13))
+      : Math.max(6, Math.min(9, Math.round(routeView?.zoom ?? 7)))
+
+    const page = await ctx.puppeteer.page()
+    try {
+      const deviceScaleFactor = Math.max(1, config.zoomLevel || 1)
+      await page.setViewport({
+        width: Math.max(320, config.viewportWidth),
+        height: Math.max(320, config.viewportHeight),
+        deviceScaleFactor,
+      })
+      await page.setUserAgent(config.userAgent)
+
+      // 关键：在任何页面脚本运行前写入 localStorage（MapService.init 会读取）
+      await page.evaluateOnNewDocument((lat: number, lon: number, z: number) => {
+        try {
+          localStorage.setItem('mapCenter', JSON.stringify([lat, lon]))
+          localStorage.setItem('mapZoom', JSON.stringify(z))
+        } catch { /* 隐私模式等场景忽略 */ }
+      }, pos.latitude, pos.longitude, zoom)
+
+      // 用 /stats（用户指定，也是官方点击航班后的默认落地页）：
+      // 实测它与 /details 一样会画出已飞航迹（品红线）与本机蓝色图标，
+      // 但左侧面板是「统计 / 实时数据」而不是飞行计划，信息更贴合航班查询场景。
+      const flightUrl = `https://fly.volanta.app/flights/${flight.id}/stats`
+      log('info', '官方页截图：注入视野 + 准备跟随', {
+        flightId: flight.id, callsign: flight.callsign,
+        lat: +pos.latitude.toFixed(4), lon: +pos.longitude.toFixed(4), zoom, lowMode,
+      })
+      await page.goto(flightUrl, { waitUntil: 'domcontentloaded', timeout: config.timeout })
+
+      // 等地图 canvas 出现并稳定
+      await page.waitForSelector('canvas.mapboxgl-canvas', { timeout: config.timeout })
+        .catch(() => log('warn', '等待官方地图 canvas 超时，继续截图流程', { flightId: flight.id }))
+      await new Promise(res => setTimeout(res, Math.max(3000, config.screenshotDelay || 0)))
+
+      // 点击「跟随航班」：把地图精确对齐到航空器（注入值可能因航位推算/缓存有几像素偏差）
+      const btn = await readFollowButton(page)
+      let followed = false
+      if (btn && btn.w) {
+        if (btn.active) {
+          followed = true
+        } else {
+          await page.mouse.click(btn.x + btn.w / 2, btn.y + btn.h / 2)
+          await new Promise(res => setTimeout(res, 2500))
+          const after = await readFollowButton(page)
+          followed = !!(after && after.active)
+        }
+      }
+      log(followed ? 'info' : 'warn', followed ? '已点击跟随航班，地图对齐到航空器' : '跟随航班按钮未命中/未激活，使用注入视野截图', {
+        flightId: flight.id, found: !!btn, wasActive: btn?.active, attempt: 1,
+      })
+      await new Promise(res => setTimeout(res, 1500))
+
+      const useJpeg = config.enableImageOptimization !== false
+      const quality = Math.min(100, Math.max(50, config.imageQuality || 80))
+      const buf = await page.screenshot(useJpeg ? { type: 'jpeg', quality } : { type: 'png' }) as Buffer
+      // 纯色空图（页面/地图未渲染）体积可能仍很大（3840x2160 纯色 JPEG ~49KB），
+      // 必须按像素标准差判断，否则会把纯黑图当用户发出去。
+      if (!buf || buf.length < 8000 || await isBlankScreenshot(buf)) {
+        log('warn', '官方页截图疑似空白（纯色/无内容）', { size: buf?.length, flightId: flight.id })
+        return null
+      }
+      log('info', '官方页截图完成', {
+        size: buf.length, format: useJpeg ? `jpeg q${quality}` : 'png', followed, zoom, lowMode,
+      })
+      return buf
+    } finally {
+      await page.close().catch(() => {})
+    }
+  }
+
   // 截图函数
   async function captureFlightScreenshot(flight: VolantaFlight): Promise<Buffer | null> {
     log('debug', '开始截图流程', {
@@ -1744,6 +2438,52 @@ export function apply(ctx: Context, config: Config) {
     if (!ctx.puppeteer) {
       log('error', 'Puppeteer服务未安装，无法截图')
       return null
+    }
+
+    // 渲染路径与视野准备：
+    // - custom 模式：巡航走自绘地图（能画出航迹/起降机场/本机图标），低空走官方页注入定位；
+    // - volanta 模式：全部用官方页，但**每班都必须注入 mapCenter/mapZoom**。官方 stats 页
+    //   不会自动定位到所查询的航班，视野来自 localStorage；残留旧值就会画到别的飞机所在
+    //   位置（实测出现过查 ZGKL→ZSWX 却截出 EGLL 的情况）。
+    const detail = await fetchFlightDetail(flight.id)
+    const { cur } = readTrackAndCurrent(detail, flight)
+    const lowMode = isLowAltitude(cur)
+    const officialView = computeOfficialView(detail, cur)
+    log('info', '高度分流', {
+      flightId: flight.id,
+      callsign: flight.callsign,
+      mapMode: config.mapMode || 'custom',
+      altitudeFt: cur ? Math.round(cur.altitude ?? cur.altitudeAgl ?? 0) : null,
+      onGround: cur?.onGround ?? null,
+      thresholdFt: config.lowAltitudeThresholdFt,
+      lowMode,
+      officialView: officialView
+        ? { lat: +officialView.lat.toFixed(3), lon: +officialView.lon.toFixed(3), zoom: officialView.zoom, mode: officialView.mode }
+        : null,
+    })
+
+    // 官方页路径：volanta 模式全高度走官方页（/stats + 跟随航班），
+    // custom 模式只在低空/接地时走官方页（巡航用自绘地图看整条航路）。
+    const mapMode = config.mapMode || 'custom'
+    const useOfficialPage = mapMode === 'volanta' || (lowMode && config.officialPageForLowAltitude !== false)
+    if (useOfficialPage) {
+      try {
+        const buf = await captureOfficialMapScreenshot(flight, detail || undefined)
+        if (buf) return buf
+        log('warn', '官方页跟随截图失败，回退自绘地图/默认页面', { flightId: flight.id, mapMode })
+      } catch (error: any) {
+        log('warn', '官方页跟随截图异常，回退自绘地图/默认页面', { error: error?.message || String(error), flightId: flight.id })
+      }
+    }
+
+    if (mapMode === 'custom') {
+      try {
+        const buf = await captureCustomMapScreenshot(flight, detail || undefined)
+        if (buf) return buf
+        log('warn', '自绘地图失败，回退 Volanta 官方页面截图', { flightId: flight.id })
+      } catch (error: any) {
+        log('warn', '自绘地图异常，回退 Volanta 官方页面截图', { error: error?.message || String(error), flightId: flight.id })
+      }
     }
 
     const maxAttempts = Math.max(1, (config.retryCount || 0) + 1)
@@ -1791,9 +2531,30 @@ export function apply(ctx: Context, config: Config) {
         
         log('debug', '设置User-Agent', { userAgent: config.userAgent })
         await page.setUserAgent(config.userAgent)
+
+        // 关键修复：官方 stats 页不会自动定位到所查询的航班，必须在页面脚本执行前
+        // 主动写入 mapCenter/mapZoom（覆盖掉同一浏览器 profile 里上一班残留的坐标）。
+        if (officialView) {
+          await page.evaluateOnNewDocument((lat: number, lon: number, z: number) => {
+            try {
+              localStorage.setItem('mapCenter', JSON.stringify([lat, lon]))
+              localStorage.setItem('mapZoom', JSON.stringify(z))
+            } catch { /* 隐私模式等场景忽略 */ }
+          }, officialView.lat, officialView.lon, officialView.zoom)
+          log('info', '官方页注入视野', {
+            mode: officialView.mode,
+            lat: +officialView.lat.toFixed(3),
+            lon: +officialView.lon.toFixed(3),
+            zoom: officialView.zoom,
+            attempt,
+          })
+        } else {
+          log('warn', '缺少航班位置，官方页将使用默认视野', { flightId: flight.id, attempt })
+        }
         
+        // 兜底路径同样用 /stats（与主路径一致，同样会画出该航班的航迹图层）
         const flightUrl = `https://fly.volanta.app/flights/${flight.id}/stats`
-        log('info', '导航到航班页面', { url: flightUrl })
+        log('info', '导航到航班页面', { url: flightUrl, attempt })
         
         await page.goto(flightUrl, { 
           waitUntil: 'domcontentloaded',
@@ -1806,77 +2567,16 @@ export function apply(ctx: Context, config: Config) {
         log('debug', '页面加载完成，等待3秒确保内容渲染')
         await new Promise(res => setTimeout(res, 3000))
         
-        // 尝试点击定位按钮（把地图居中到航班当前位置）
-        // 说明：
-        // - XPath 选中的可能是 <a> 里的 <img>，直接 click img 未必触发 Angular 绑定
-        //   在 <a> 上的点击处理器，因此统一冒泡点击其父级 <a>；
-        // - 按钮可能晚于页面文本渲染，使用轮询（最长 8 秒）而不是只查一次；
-        // - page.evaluate 返回 DOM 节点会被序列化成空对象，因此查找与点击必须在
-        //   evaluate 内部一次完成，只向 Node 侧返回布尔值。
-        const locateButtonXPaths = [
-          '/html/body/app-root/div/app-flight-view/div/div/app-flight-card-header/div/ul[3]/li[2]/a/img',
-          '/html/body/app-root/div/app-flight-view/div/div/app-flight-card-header/div/ul[3]/li[2]/a',
-        ]
-        log('debug', '尝试查找定位按钮', { xpaths: locateButtonXPaths })
-
-        const clickLocateButton = async (targetPage: any, xpaths: string[], waitMs: number): Promise<boolean> => {
-          const deadline = Date.now() + waitMs
-          while (Date.now() < deadline) {
-            const clicked = await targetPage.evaluate((selectors: string[]) => {
-              for (const xpath of selectors) {
-                try {
-                  const result = document.evaluate(
-                    xpath,
-                    document,
-                    null,
-                    XPathResult.FIRST_ORDERED_NODE_TYPE,
-                    null,
-                  )
-                  const node = result.singleNodeValue as HTMLElement | null
-                  if (!node) continue
-                  // 优先点击承载点击处理器的 <a>，其次才是命中的元素本身
-                  const target = ((node as any).closest?.('a') as HTMLElement) || node
-                  const rect = target.getBoundingClientRect()
-                  const options: MouseEventInit = {
-                    bubbles: true,
-                    cancelable: true,
-                    view: window,
-                    clientX: rect.left + rect.width / 2,
-                    clientY: rect.top + rect.height / 2,
-                  }
-                  // 完整的鼠标事件序列，兼容监听 mousedown/mouseup 的框架
-                  for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'] as const) {
-                    const EventCtor = type.startsWith('pointer') && typeof PointerEvent === 'function' ? PointerEvent : MouseEvent
-                    target.dispatchEvent(new EventCtor(type, options))
-                  }
-                  return true
-                } catch {
-                  continue
-                }
-              }
-              return false
-            }, xpaths).catch((error: any) => {
-              log('warn', '定位按钮点击执行出错', { error: error?.message || String(error) })
-              return false
-            })
-            if (clicked) return true
-            await new Promise(res => setTimeout(res, 500))
-          }
-          return false
+        // 复核更正（2026-10-21）：header 里那颗 follow.svg 其实是「跟随航班」按钮（不是关注/取关），
+        // 点击它会把地图精确对齐到航空器。此兜底路径同样点一次，保证画面中心是这架飞机。
+        const btn = await readFollowButton(page)
+        if (btn && btn.w && !btn.active) {
+          await page.mouse.click(btn.x + btn.w / 2, btn.y + btn.h / 2)
+          await new Promise(res => setTimeout(res, 2000))
         }
+        log('debug', '兜底路径：已尝试跟随航班并截图', { attempt, followFound: !!btn })
 
-        try {
-          const clicked = await clickLocateButton(page, locateButtonXPaths, 8000)
-          if (clicked) {
-            log('info', '定位按钮已点击，等待地图重新居中')
-          } else {
-            log('warn', '未找到定位按钮，跳过地图定位', { xpaths: locateButtonXPaths })
-          }
-        } catch (error: any) {
-          log('warn', '点击定位按钮失败，继续截图', { error: error.message })
-        }
-
-        log('debug', '定位操作完成，等待2秒')
+        log('debug', '等待地图渲染', { attempt })
         await new Promise(res => setTimeout(res, 2000))
         
         log('info', `等待地图加载 ${config.screenshotDelay}ms`)
@@ -1934,10 +2634,11 @@ export function apply(ctx: Context, config: Config) {
         }) as Buffer
         const screenshotDuration = Date.now() - screenshotStartTime
 
-        // 空白检测：页面完全未渲染时整页 PNG 体积极小（正常渲染远大于该阈值）
-        if (screenshot.length < 20000 && renderState.textLength < 50) {
+        // 空白检测：页面完全未渲染时整页 PNG 体积极小；但高分辨率纯色空图体积仍可能很大，
+        // 因此再用像素标准差识别纯色图（两者任一命中即视为空白）。
+        if (screenshot.length < 20000 || await isBlankScreenshot(screenshot)) {
           blankDetected = true
-          log('warn', '截图疑似空白页面（页面未完成渲染）', {
+          log('warn', '截图疑似空白页面（页面未完成渲染/纯色）', {
             size: screenshot.length,
             renderState,
             failedRequests,
@@ -2109,7 +2810,7 @@ export function apply(ctx: Context, config: Config) {
       case OutputFormat.IMAGE_ONLY:
         log('debug', '使用IMAGE_ONLY输出格式')
         mainMessage = effectiveScreenshot
-          ? [h.image(effectiveScreenshot, 'image/png')]
+          ? [h.image(effectiveScreenshot, sniffImageMime(effectiveScreenshot))]
           : [imageBlocked ? AI_BLOCK_NOTICE : '截图失败，请稍后重试。']
         break
 
@@ -2122,7 +2823,7 @@ export function apply(ctx: Context, config: Config) {
       default:
         log('debug', '使用BOTH输出格式')
         if (effectiveScreenshot) {
-          mainMessage = [h.image(effectiveScreenshot, 'image/png'), '\n' + baseInfo]
+          mainMessage = [h.image(effectiveScreenshot, sniffImageMime(effectiveScreenshot)), '\n' + baseInfo]
         } else if (imageBlocked) {
           mainMessage = [`${AI_BLOCK_NOTICE}\n${baseInfo}`]
         } else {
@@ -2145,6 +2846,38 @@ export function apply(ctx: Context, config: Config) {
 
     // 命令2: 绑定 <networkUserName> - 添加强制刷新
   // 命令1.5: volanta航班 <flightNumber> - 通过航班号查询 Volanta 航班
+
+  /**
+   * 让用户在多条命中里按序号自选航班。返回 null 表示取消/超时/无效。
+   * 列表同时给出航班号与用户名（呼号），方便用户分辨同名/同号航班。
+   */
+  async function promptFlightSelection(
+    session: Session,
+    matchedFlights: VolantaFlight[],
+    keyword: string,
+  ): Promise<VolantaFlight | null> {
+    const summaries = await Promise.all(matchedFlights.map(async (flight, index) => {
+      const originLabel = await formatAirportLabel(flight.originIcao)
+      const destinationLabel = await formatAirportLabel(flight.destinationIcao)
+      const userLabel = flight.networkUserName || flight.networkUserId || '未知用户'
+      const callsignLabel = flight.callsign || '无呼号'
+      const flightNumberLabel = flight.flightNumber || '无航班号'
+      return `${index + 1}. 航班号 ${flightNumberLabel} · 用户 ${userLabel}（呼号 ${callsignLabel}）· ${originLabel} → ${destinationLabel}`
+    }))
+    await session.send([
+      `找到 ${matchedFlights.length} 条与「${keyword}」匹配的航班，请回复序号选择：`,
+      ...summaries,
+      '回复"取消"退出。'
+    ].join('\n'))
+    const choice = await session.prompt(config.selectionTimeout)
+    if (!choice) return null
+    const normalizedChoice = choice.trim()
+    if (/^(取消|cancel|exit)$/i.test(normalizedChoice)) return null
+    const selectedIndex = parseInt(normalizedChoice, 10) - 1
+    if (Number.isNaN(selectedIndex) || selectedIndex < 0 || selectedIndex >= matchedFlights.length) return null
+    return matchedFlights[selectedIndex]
+  }
+
   const volantaFlightCmd = ctx.command('volanta航班 <flightNumber>', '通过航班号查询 Volanta 航班')
     .option('en', '-en 使用英文输出')
     .action(async ({ session, options }, flightNumber) => {
@@ -2178,12 +2911,29 @@ export function apply(ctx: Context, config: Config) {
         progressMessageIds = await session.send(session.platform === 'discord' || options?.en ? `Searching Volanta flight ${searchFlightNumber}, please wait...` : `正在查询 Volanta 航班 ${searchFlightNumber}，请稍候...`)
 
         const flights = await fetchAllFlights(config.forceRefresh)
-        const matchedFlights = flights.filter(flight =>
-          flight.flightNumber && flight.flightNumber.toUpperCase() === searchFlightNumber
+        const normalizedQuery = searchFlightNumber
+        // 优先按航班号精确匹配；未命中时回退匹配呼号 / 用户名，兼容把呼号当航班号输入的情况
+        // （如 JAF1 是呼号、航班号实为 JF1，用户输 volanta航班 JAF1 也应能查到）。
+        let matchField: 'flightNumber' | 'callsign' | 'networkUserName' = 'flightNumber'
+        let matchedFlights = flights.filter(flight =>
+          flight.flightNumber && flight.flightNumber.toUpperCase() === normalizedQuery
         )
+        if (!matchedFlights.length) {
+          matchField = 'callsign'
+          matchedFlights = flights.filter(flight =>
+            flight.callsign && flight.callsign.toUpperCase() === normalizedQuery
+          )
+        }
+        if (!matchedFlights.length) {
+          matchField = 'networkUserName'
+          matchedFlights = flights.filter(flight =>
+            flight.networkUserName && flight.networkUserName.toUpperCase() === normalizedQuery
+          )
+        }
 
         log('info', 'volanta航班查询命中数量', {
           searchFlightNumber,
+          matchField,
           matchCount: matchedFlights.length
         })
 
@@ -2197,48 +2947,11 @@ export function apply(ctx: Context, config: Config) {
         if (matchedFlights.length === 1) {
           selectedFlight = matchedFlights[0]
         } else {
-          const summaries = await Promise.all(matchedFlights.map(async (flight, index) => {
-            const originLabel = await formatAirportLabel(flight.originIcao)
-            const destinationLabel = await formatAirportLabel(flight.destinationIcao)
-            const userLabel = flight.networkUserName || flight.networkUserId || '未知用户'
-            const callsignLabel = flight.callsign || '无呼号'
-            return {
-              flight,
-              summary: `${index + 1}. ${userLabel} (${callsignLabel}) - ${originLabel} → ${destinationLabel}`
-            }
-          }))
-
-          const selectionLines = [
-            `找到 ${summaries.length} 条 ${searchFlightNumber} 的匹配记录：`,
-            ...summaries.map(item => item.summary),
-            '请回复序号选择航班，或发送"取消"退出。'
-          ]
-          await session.send(selectionLines.join('\n'))
-
-          const choice = await session.prompt(config.selectionTimeout)
-          if (!choice) {
+          selectedFlight = await promptFlightSelection(session, matchedFlights, searchFlightNumber)
+          if (!selectedFlight) {
             await recallProgress()
-            return `选择超时（${Math.round(config.selectionTimeout / 1000)} 秒）`
+            return '已取消、选择超时或无效，未选择航班'
           }
-
-          const normalizedChoice = choice.trim()
-          if (!normalizedChoice) {
-            await recallProgress()
-            return '选择内容为空'
-          }
-
-          if (/^(取消|cancel|exit)$/i.test(normalizedChoice)) {
-            await recallProgress()
-            return '已取消'
-          }
-
-          const selectedIndex = parseInt(normalizedChoice, 10) - 1
-          if (Number.isNaN(selectedIndex) || selectedIndex < 0 || selectedIndex >= summaries.length) {
-            await recallProgress()
-            return '选择无效'
-          }
-
-          selectedFlight = summaries[selectedIndex].flight
         }
 
         if (!selectedFlight) {
@@ -2269,6 +2982,7 @@ export function apply(ctx: Context, config: Config) {
         await sendFlightForward(session, routeMessage, mainMessage)
       } catch (error: any) {
         await recallProgress()
+        if (error instanceof ForwardSendError) return error.message
         log('error', 'volanta航班查询失败', {
           flightNumber: searchFlightNumber,
           error: error.message,
@@ -2509,6 +3223,7 @@ const queryCmd = ctx.command('volanta查询 [target]', '查询被@用户、呼�
         await sendFlightForward(session, routeMessage, mainMessage)
         
       } catch (error: any) {
+        if (error instanceof ForwardSendError) return error.message
         log('error', '处理@用户查询请求时发生错误', { 
           targetUserId,
           targetUserName,
@@ -2541,11 +3256,19 @@ const queryCmd = ctx.command('volanta查询 [target]', '查询被@用户、呼�
 
         // 强制刷新Volanta数据
         const progressIds = await session.send(`正在搜索 ${searchTarget} 的 Volanta 航班，请稍候...`)
-        const flight = await fetchFlightByQuery(searchTarget || '', config.forceRefresh)
-        
-        if (!flight) {
+        const matches = await fetchAllFlightsByQuery(searchTarget || '', config.forceRefresh)
+
+        if (!matches.length) {
           log('info', '未找到指定关键词的航班', { searchTarget })
           return `❌ 未找到与 "${searchTarget}" 匹配的 Volanta 在飞航班（可使用呼号、用户名或航班号）。`
+        }
+
+        // 多条命中时列出航班号/用户名，让用户自己回序号选择，再输出详情
+        const flight = matches.length === 1
+          ? matches[0]
+          : await promptFlightSelection(session, matches, searchTarget || '')
+        if (!flight) {
+          return '已取消、选择超时或无效，未选择航班'
         }
 
         if (flight.privacyOption !== 'Public') {
@@ -2574,6 +3297,7 @@ const queryCmd = ctx.command('volanta查询 [target]', '查询被@用户、呼�
         }
         
       } catch (error: any) {
+        if (error instanceof ForwardSendError) return error.message
         log('error', '处理关键词查询请求时发生错误', { 
           searchTarget,
           error: error.message,
@@ -2641,6 +3365,7 @@ const queryCmd = ctx.command('volanta查询 [target]', '查询被@用户、呼�
         await sendFlightForward(session, routeMessage, mainMessage)
         
       } catch (error: any) {
+        if (error instanceof ForwardSendError) return error.message
         log('error', '处理当前用户查询请求时发生错误', { 
           currentUserId,
           error: error.message,
@@ -2812,6 +3537,8 @@ const queryCmd = ctx.command('volanta查询 [target]', '查询被@用户、呼�
           error: error.message,
           stack: error.stack,
         })
+        // 合并转发失败不降级发送：直接返回固定提示，不再走下面的数据降级重新发一条文本。
+        if (error instanceof ForwardSendError) return error.message
         // 降级：资料/航班接口（api.volanta.app）不可用时，尝试从实时航班数据
         // （webassets.volanta.app，不同主机）获取该用户的在飞信息，至少给出基本状态。
         const reason = describeHttpError(error)
